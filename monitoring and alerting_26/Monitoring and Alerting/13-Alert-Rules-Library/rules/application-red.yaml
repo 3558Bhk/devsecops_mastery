@@ -1,0 +1,168 @@
+# Generic application / service-level (RED) alerting.
+# Assumes an instrumented service exposing:
+#   http_requests_total{job,service,namespace,method,path,status}
+#   http_request_duration_seconds_bucket{job,service,namespace,le}
+#   http_request_duration_seconds_{sum,count}
+# Replace `service="checkout-api"` selectors with your own, or generalise with
+# `by (service, namespace)` and route on the `service` label in Alertmanager.
+groups:
+  - name: application-red
+    rules:
+      # ── Errors ──────────────────────────────────────────────────────────
+      # The traffic guard (`> 1 req/s`) is what stops a single error on an idle
+      # service from paging you at 3am. Tune the guard to your service's floor.
+      - alert: ServiceHighErrorRatio
+        expr: |
+          (
+            sum by (service, namespace) (rate(http_requests_total{status=~"5.."}[5m]))
+              /
+            clamp_min(sum by (service, namespace) (rate(http_requests_total{status!~"4.."}[5m])), 1e-9)
+          ) > 0.05
+          and
+          sum by (service, namespace) (rate(http_requests_total[5m])) > 1
+        for: 10m
+        labels: {severity: page, team: app}
+        annotations:
+          summary: "{{ $labels.service }} error ratio {{ $value | humanizePercentage }} (>5%) for 10m"
+          description: "Users of {{ $labels.service }} in {{ $labels.namespace }} are receiving 5xx responses."
+          runbook: "https://runbooks.example.com/app/high-error-ratio"
+          dashboard: "https://grafana.example.com/d/service-red?var-service={{ $labels.service }}&var-namespace={{ $labels.namespace }}"
+
+      - alert: ServiceElevatedErrorRatio
+        expr: |
+          (
+            sum by (service, namespace) (rate(http_requests_total{status=~"5.."}[5m]))
+              /
+            clamp_min(sum by (service, namespace) (rate(http_requests_total{status!~"4.."}[5m])), 1e-9)
+          ) > 0.01
+          and
+          sum by (service, namespace) (rate(http_requests_total[5m])) > 1
+        for: 30m
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $labels.service }} error ratio {{ $value | humanizePercentage }} (>1%) for 30m"
+
+      - alert: ServiceAllInstancesDown
+        expr: |
+          sum by (job) (up) == 0
+        for: 3m
+        labels: {severity: page, team: app}
+        annotations:
+          summary: "Every instance of {{ $labels.job }} is down"
+          description: "Total outage for this job — no traffic is being served or scraped."
+          runbook: "https://runbooks.example.com/app/service-down"
+
+      - alert: ServiceSomeInstancesDown
+        expr: |
+          (count by (job) (up == 0) > 0)
+            and
+          (count by (job) (up == 1) > 0)
+        for: 10m
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $value }} instance(s) of {{ $labels.job }} are down (service still degraded-tolerant)"
+
+      # ── Latency ─────────────────────────────────────────────────────────
+      - alert: ServiceHighLatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (service, namespace, le) (
+              rate(http_request_duration_seconds_bucket[5m]))) > 1.0
+          and
+          sum by (service, namespace) (rate(http_request_duration_seconds_count[5m])) > 1
+        for: 15m
+        labels: {severity: page, team: app}
+        annotations:
+          summary: "{{ $labels.service }} p99 latency {{ $value | humanizeDuration }} (>1s) for 15m"
+          description: "Check the latency heatmap, dependency latency, CPU throttling and recent deploys."
+          runbook: "https://runbooks.example.com/app/high-latency"
+          dashboard: "https://grafana.example.com/d/service-red?var-service={{ $labels.service }}&from=now-1h"
+
+      - alert: ServiceHighLatencyP50
+        expr: |
+          histogram_quantile(0.50,
+            sum by (service, namespace, le) (
+              rate(http_request_duration_seconds_bucket[5m]))) > 0.3
+        for: 30m
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $labels.service }} MEDIAN latency {{ $value | humanizeDuration }} (>300ms)"
+          description: "A high p50 means the whole service is slow, not just a tail — usually a dependency or saturation issue."
+
+      - alert: ServiceLatencyRegressionVsLastWeek
+        expr: |
+          job:http_request_duration_seconds:p99
+            > 1.5 * (job:http_request_duration_seconds:p99 offset 7d)
+          and job:http_request_duration_seconds:p99 > 0.2
+        for: 2h
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $labels.job }} p99 is >1.5x its value from 7 days ago"
+
+      # ── Traffic anomalies ───────────────────────────────────────────────
+      - alert: ServiceTrafficDroppedToZero
+        expr: |
+          sum by (service) (rate(http_requests_total[10m])) == 0
+          unless
+          sum by (service) (rate(http_requests_total[10m] offset 1d)) == 0
+        for: 15m
+        labels: {severity: page, team: app}
+        annotations:
+          summary: "{{ $labels.service }} is receiving NO traffic (but did at this time yesterday)"
+          description: "Either an upstream routing/DNS failure, or the service is unreachable. Absence of traffic is a symptom."
+
+      - alert: ServiceTrafficSurge
+        expr: |
+          sum by (service) (rate(http_requests_total[5m]))
+            > 4 * sum by (service) (rate(http_requests_total[5m] offset 7d))
+          and
+          sum by (service) (rate(http_requests_total[5m])) > 10
+        for: 15m
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $labels.service }} traffic is {{ $value | humanize }} req/s — >4x the same time last week"
+          description: "Could be a marketing event, a retry storm, a crawler, or an attack."
+
+      # ── Runtime / process ───────────────────────────────────────────────
+      - alert: ServiceHighGoroutineCount
+        expr: go_goroutines{job!~"prometheus|alertmanager"} > 20000
+        for: 15m
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }} has {{ $value | humanize }} goroutines"
+          description: "Likely a leak (unclosed channels, missing context cancellation) or unbounded concurrency."
+
+      - alert: ServiceProcessRestarted
+        expr: resets(process_start_time_seconds[15m]) > 0
+        for: 0m
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }} restarted in the last 15m"
+          description: "`resets()` on a counter/monotonic gauge detects process restarts even without kube-state-metrics."
+
+      - alert: ServiceConnectionPoolExhausted
+        expr: |
+          sum by (service, pool) (db_pool_connections_in_use)
+            / clamp_min(sum by (service, pool) (db_pool_connections_max), 1) > 0.90
+        for: 10m
+        labels: {severity: page, team: app}
+        annotations:
+          summary: "{{ $labels.service }} pool '{{ $labels.pool }}' at {{ $value | humanizePercentage }} of max connections"
+          description: "Requests will start queueing then timing out. Check for leaked connections and slow queries."
+
+      - alert: ServiceQueueBacklogGrowing
+        expr: |
+          predict_linear(queue_depth_messages[30m], 30 * 60) > 10000
+          and queue_depth_messages > 100
+        for: 15m
+        labels: {severity: ticket, team: app}
+        annotations:
+          summary: "{{ $labels.service }} queue projected to exceed 10k messages within 30m"
+
+      - alert: ServiceQueueAgeTooHigh
+        expr: queue_oldest_message_age_seconds > 300
+        for: 10m
+        labels: {severity: page, team: app}
+        annotations:
+          summary: "Oldest message in {{ $labels.service }} queue is {{ $value | humanizeDuration }} old"
+          description: "A depth-based alert misses this: a shallow queue can still be stuck. Age is the better symptom."

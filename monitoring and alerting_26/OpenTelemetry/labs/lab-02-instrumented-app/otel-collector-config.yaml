@@ -1,0 +1,269 @@
+# =============================================================================
+# Lab 02 — Instrumented application -> Collector -> Tempo + Prometheus + Loki
+# =============================================================================
+# MACHINE-VALIDATED against otelcol-contrib v0.161.0:
+#   otelcol-contrib validate --config=otel-collector-config.yaml
+#
+# Demonstrates: all three signals in one pipeline set, span_metrics connector,
+# resource enrichment, redaction, and the metric<->trace<->log triangle.
+#
+# Companion reading: ../../05-traces.md, ../../06-metrics.md, ../../07-logs.md,
+#                    ../../11-collector.md
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # Persistent queue storage so buffered data survives a Collector restart.
+  # ★ Without `create_directory: true`, validate FAILS if the path is missing:
+  #   "directory must exist: stat ... no such file or directory.
+  #    You can enable the create_directory option to automatically create it"
+  file_storage:
+    directory: /var/lib/otelcol
+    create_directory: true
+    timeout: 1s
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins: ["http://localhost:*", "http://127.0.0.1:*"]
+
+processors:
+  # ★★ FIRST in every pipeline, always.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Normalise identity. resource_detection would add host/container facts;
+  # in compose we set them explicitly so the lab is deterministic.
+  resource/enrich:
+    attributes:
+      - key: deployment.environment.name
+        value: lab
+        action: upsert
+      - key: lab.name
+        value: lab-02-instrumented-app
+        action: upsert
+      # ★ Do NOT copy request-scoped identifiers onto the resource — that is how
+      #   a metric cardinality explosion starts. See ../../14-scale-cost-and-cardinality.md
+
+  # ★ PII redaction at the boundary. See ../../15-security-and-governance.md
+  #   Stability in v0.161.0: traces Beta, logs Alpha, metrics Alpha.
+  redaction:
+    # allow_all_keys: true  => blocked_values still applies, but an unanticipated
+    # attribute name passes through. This FAILS OPEN. Fine for a lab; in production
+    # prefer an explicit allowed_keys list, which FAILS CLOSED.
+    allow_all_keys: true
+    redact_all_types: true          # also inspect ints via AsString()
+    blocked_key_patterns:
+      - ".*token.*"
+      - ".*api_key.*"
+      - ".*password.*"
+    blocked_values:
+      - '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'   # email
+      - '\b\d{3}-\d{2}-\d{4}\b'                                  # US SSN shape
+      - "4[0-9]{12}(?:[0-9]{3})?"                                # Visa
+    # ★ allowed_values TAKES PRECEDENCE over blocked_values
+    allowed_values:
+      - ".+@example\\.com"
+    # ★ summary: silent in production — `debug` would emit
+    #   redaction.redacted.keys, telling an attacker exactly which sensitive
+    #   fields you handle. Here we use `info` (counts only) so the lab is legible.
+    summary: info
+    url_sanitizer:
+      enabled: true
+      attributes: ["http.url", "url", "url.full"]
+      sanitize_span_name: true      # ★ also fixes span-name cardinality
+
+  # ★ LAST in the pipeline.
+  batch:
+    send_batch_size: 4096
+    send_batch_max_size: 8192
+    timeout: 5s
+
+connectors:
+  # traces -> metrics, with no application code involved.
+  span_metrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    # ★ service.name and service.instance.id are DEFAULT dimensions — listing
+    #   them again fails: `failed validating dimensions: duplicate dimension name`
+    dimensions:
+      - name: http.route
+      - name: http.request.method
+      - name: http.response.status_code
+    # ★ `dimensions_cache_size` is DEPRECATED in v0.161.0 — still accepted (so
+    #   old configs validate), but use the replacement:
+    aggregation_cardinality_limit: 1000
+    # ★ useSecondAsDefaultMetricsUnit gate is OFF -> durations are MILLISECONDS
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+
+  # ★★ The `redaction` processor emits NO internal metrics — verified in
+  #   v0.161.0: processor/redactionprocessor has no generated_telemetry.go and
+  #   no metrics in metadata.yaml. What it emits are ATTRIBUTES ON THE DATA
+  #   (redaction.masked.count, redaction.allowed.count, ...) when summary is
+  #   `info` or `debug`.
+  #
+  #   So to ALERT on redaction you must derive a metric from those attributes.
+  #   This second span_metrics instance does exactly that: it uses
+  #   redaction.masked.count as a dimension, producing a queryable series.
+  #   ★ The redaction processor runs BEFORE the connector in the pipeline, so
+  #     the attribute is already present when spans reach it.
+  span_metrics/redaction_audit:
+    namespace: redaction.audit
+    histogram:
+      explicit:
+        buckets: [1ms, 10ms, 100ms, 1s]
+    dimensions:
+      - name: redaction.masked.count
+      - name: redaction.ignored.count
+    aggregation_cardinality_limit: 100
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+
+exporters:
+  # ---------------------------------------------------------------- traces
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    # ★★ BOTH of these are DISABLED BY DEFAULT. Enable them or a momentary
+    #    backend blip drops data instantly with no retry.
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+      num_consumers: 10
+      storage: file_storage          # survives a Collector restart
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s         # ★ 0 would retry forever — set a real bound
+
+  # ---------------------------------------------------------------- metrics
+  # Pull model: Prometheus scrapes this.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    send_timestamps: true
+    metric_expiration: 10m
+    enable_open_metrics: true
+    # ★ true turns EVERY resource attribute into a label on EVERY series.
+    #   Convenient, and a cardinality multiplier you did not choose deliberately.
+    resource_to_telemetry_conversion:
+      enabled: false
+
+  # Push model: remote-write straight into Prometheus.
+  # ★ Prometheus requires CUMULATIVE temporality. Our span_metrics connector is
+  #   configured cumulative above, so no delta_to_cumulative processor is needed.
+  prometheus_remote_write/prom:
+    endpoint: http://prometheus:9090/api/v1/write
+    # ★ Requires --web.enable-otlp-receiver? No — this is the classic remote-write
+    #   endpoint, enabled by default in Prometheus 3.x.
+    resource_to_telemetry_conversion:
+      enabled: false
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+      num_consumers: 10
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    # ★ Verified: exporter.prometheusremotewritexporter.RetryOn429 is FALSE by
+    #   default — 429s from a rate-limiting backend are NOT retried unless you
+    #   enable that gate.
+
+  # ------------------------------------------------------------------- logs
+  # ★★ VERIFIED: there is NO `loki` EXPORTER in otelcol-contrib v0.161.0.
+  #   `loki` exists only as a RECEIVER (to read FROM Loki). Writing
+  #   `loki: {endpoint: ...}` fails with:
+  #     'exporters' unknown type: "loki" for id: "loki" (valid values: [...])
+  #   The correct path is Loki's NATIVE OTLP ingestion, which is better anyway:
+  #   no translation layer, resource attributes preserved as structured metadata.
+  #
+  #   `otlphttp` appends /v1/logs, so endpoint http://loki:3100/otlp posts to
+  #   http://loki:3100/otlp/v1/logs.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+    # ★★ Label promotion is decided LOKI-SIDE, not here. Loki promotes a fixed
+    #   default set of RESOURCE attributes to index labels — service.name,
+    #   service.namespace, service.instance.id, container.name,
+    #   deployment.environment, and the k8s.* family (cluster/namespace/pod/
+    #   deployment/replicaset/statefulset/daemonset/job/cronjob/container) plus
+    #   cloud.region and cloud.availability_zone. Configurable in Loki via
+    #   distributor.otlp_config.default_resource_attributes_as_index_labels.
+    #
+    #   EVERYTHING ELSE becomes STRUCTURED METADATA — queryable but not indexed:
+    #     body            -> the log line (__line__ in LogQL)
+    #     trace_id        -> metadata[trace_id]     ★ metadata, NOT a label
+    #     span_id         -> metadata[span_id]
+    #     severity_text   -> metadata[severity_text] (+ detected_level label)
+    #     severity_number -> metadata[severity_number]
+    #     scope name      -> metadata[scope_name]
+    #     attribute X.Y   -> metadata[x_y]   (dots become underscores)
+    #
+    #   ★ This is the design doing the right thing for you: trace_id lands in
+    #     structured metadata rather than as a label, which is exactly where a
+    #     high-cardinality identifier belongs. Never fight it by adding trace_id
+    #     as a resource attribute — you would create a label per trace.
+    #   Requires `allow_structured_metadata: true` in loki-config.yaml (set here).
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+      num_consumers: 10
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  debug:
+    verbosity: basic          # ★ never `detailed` in production — PII to stdout
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+service:
+  extensions: [health_check, file_storage]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0        # ★ default is localhost — invisible to Prometheus
+                port: 8888
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/enrich, redaction, batch]
+      # ★ Both span_metrics instances are CONNECTORS: exporters here, and
+      #   receivers in the metrics pipeline below. Missing either role fails:
+      #     connector "X" used as exporter in [traces] pipeline but not used
+      #     in any supported receiver pipeline
+      exporters: [otlp/tempo, span_metrics, span_metrics/redaction_audit, debug]
+
+    metrics:
+      receivers: [otlp, span_metrics, span_metrics/redaction_audit]
+      processors: [memory_limiter, resource/enrich, batch]
+      exporters: [prometheus, prometheus_remote_write/prom, debug]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/enrich, redaction, batch]
+      exporters: [otlphttp/loki, debug]

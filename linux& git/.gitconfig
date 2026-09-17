@@ -1,0 +1,8 @@
+[rerere]
+	enabled = true
+[rebase]
+	autoSquash = true
+[merge]
+	tool = meld
+[mergetool]
+	keepBackup = false

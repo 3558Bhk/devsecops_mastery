@@ -1,0 +1,130 @@
+# Lab stack: Prometheus 3 + Alertmanager + node_exporter + blackbox_exporter + Grafana
+#
+#   docker compose up -d
+#   Prometheus    http://localhost:9090
+#   Alertmanager  http://localhost:9093
+#   Grafana       http://localhost:3000   (admin / admin)
+#   Demo app      http://localhost:8000   (and /metrics)
+#
+#   docker compose down          # stop
+#   docker compose down -v       # stop and wipe all TSDB/dashboard data
+#
+# All services bind 0.0.0.0 so this also works inside a remote sandbox/devcontainer.
+
+name: monitoring-lab
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: lab-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.wal-compression=true
+      - --web.enable-lifecycle              # allows: curl -XPOST localhost:9090/-/reload
+      - --web.enable-admin-api              # allows snapshots / tsdb admin
+      - --web.listen-address=0.0.0.0:9090
+      - --enable-feature=exemplar-storage
+      # - --enable-feature=native-histograms   # try this in Lab 6
+      # - --web.enable-otlp-receiver           # try this in Lab 6
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.0
+    container_name: lab-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+      - --cluster.listen-address=0.0.0.0:9094
+      - --log.level=debug                   # noisy, but great for learning routing
+    ports: ["9093:9093", "9094:9094"]
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./templates:/etc/alertmanager/templates:ro
+      - alertmanager-data:/alertmanager
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    container_name: lab-node-exporter
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    pid: host
+    ports: ["9100:9100"]
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.27.0
+    container_name: lab-blackbox
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+      - --web.listen-address=0.0.0.0:9115
+    ports: ["9115:9115"]
+    volumes:
+      - ./blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    restart: unless-stopped
+
+  # A tiny Flask app that exports RED metrics and can be told to fail or slow down.
+  # This is the service you will break on purpose in every lab.
+  demo-app:
+    build: ./app
+    container_name: lab-app
+    ports: ["8000:8000"]
+    environment:
+      FAILURE_RATE: "0.0"        # 0.0 → 0.95  (Lab 4: make it 0.30)
+      LATENCY_MS: "20"           # Lab 4: make it 1200
+    restart: unless-stopped
+
+  # A plain HTTP target for blackbox probes and for `up` experiments.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: lab-nginx
+    ports: ["8081:80"]
+    restart: unless-stopped
+
+  # Where notifications land, so you can see the rendered payload without a
+  # real Slack/PagerDuty account.  curl http://localhost:5001/notifications
+  webhook-sink:
+    image: kennethreitz/httpbin:latest
+    container_name: lab-webhook
+    ports: ["5001:80"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    container_name: lab-grafana
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 5s
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

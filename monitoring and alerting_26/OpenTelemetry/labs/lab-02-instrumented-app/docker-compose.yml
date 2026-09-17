@@ -1,0 +1,227 @@
+# =============================================================================
+# Lab 02 — Instrumented application -> Collector -> Tempo + Prometheus + Loki
+# =============================================================================
+#   docker compose up -d --build
+#
+#   Demo app            http://localhost:8000   (/healthz /products/x /checkout)
+#   Grafana             http://localhost:3000   (admin / admin)
+#   Tempo               http://localhost:3200
+#   Loki                http://localhost:3100
+#   Prometheus          http://localhost:9090
+#   Collector OTLP      localhost:4317 (gRPC) / localhost:4318 (HTTP)
+#   Collector health    http://localhost:13133
+#
+#   docker compose logs -f checkout      # app logs WITH trace_id/span_id
+#   docker compose logs -f collector     # debug exporter output
+#   docker compose down -v               # stop and wipe all state
+#
+# First build takes a few minutes (pip install + opentelemetry-bootstrap).
+# Image tags verified on Docker Hub 2026-09-17.
+# =============================================================================
+
+name: otel-lab-02
+
+services:
+  # ---------------------------------------------------------------------------
+  # THE APPLICATION. Zero-code auto-instrumentation via `opentelemetry-instrument`.
+  #
+  # ★★ Everything OTel-related is configured by ENVIRONMENT VARIABLE, not code.
+  #   The same image runs unchanged in dev, staging and production — which is the
+  #   whole point. See ../../09-sdks-and-instrumentation.md
+  # ---------------------------------------------------------------------------
+  checkout:
+    build: ./app
+    image: lab02-checkout:latest
+    container_name: lab02-checkout
+    environment:
+      # --- identity -------------------------------------------------------
+      # ★ OTEL_SERVICE_NAME wins over the resource detector. Without it you get
+      #   service.name = "unknown_service:python" and every query by service fails.
+      OTEL_SERVICE_NAME: checkout-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment.name=lab,service.version=1.0.0,service.namespace=lab02"
+
+      # --- exporter -------------------------------------------------------
+      # ★ gRPC = 4317. Using 4318 here would be the single most common
+      #   "no data at all" cause — and it fails silently from the app's view.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+
+      # --- sampling -------------------------------------------------------
+      # ★ parentbased_* is what keeps a distributed trace coherent: a child span
+      #   follows its parent's decision instead of re-rolling. A bare
+      #   traceidratio sampler here would break traces at service boundaries.
+      #   We sample 100% in the SDK and let the COLLECTOR do tail sampling
+      #   (Lab 03) — that is the recommended split. See ../../10-sampling.md
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
+
+      # --- batching / reliability -----------------------------------------
+      # Smaller than production defaults so the lab feels responsive.
+      # ★ In production these are LOSS POINTS: when the queue fills, spans are
+      #   dropped SILENTLY. See ../../16-troubleshooting.md §16.6
+      OTEL_BSP_SCHEDULE_DELAY: "2000"
+      OTEL_BSP_MAX_QUEUE_SIZE: "2048"
+      OTEL_BSP_MAX_EXPORT_BATCH_SIZE: "512"
+      OTEL_BSP_EXPORT_TIMEOUT: "30000"
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
+
+      # --- logs -----------------------------------------------------------
+      # ★ This is what injects otelTraceID / otelSpanID / otelServiceName into
+      #   every LogRecord. The FORMATTER in app/main.py has to print them —
+      #   the SDK adds the fields, your format string decides whether they appear.
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+      OTEL_PYTHON_LOG_CORRELATION: "true"
+      OTEL_LOGS_EXPORT_INTERVAL: "2000"
+
+      # --- propagation ----------------------------------------------------
+      # ★ W3C tracecontext + baggage. Do NOT add b3/jaeger unless something in
+      #   the call chain still speaks them — see ../../03-context-and-propagation.md
+      OTEL_PROPAGATORS: tracecontext,baggage
+
+      # Downstream dependency, so traces span more than one service.
+      PAYMENTS_URL: http://checkout:8000/payments
+    ports: ["8000:8000"]
+    depends_on:
+      collector:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Load generator. Hits the interesting endpoints, including a 404 and a 503,
+  # so there is always an error trace to find.
+  # ---------------------------------------------------------------------------
+  loadgen:
+    image: alpine:3.21
+    container_name: lab02-loadgen
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl >/dev/null
+        APP=http://checkout:8000
+        i=0
+        echo "Driving traffic against $APP every 2s"
+        while true; do
+          i=$((i + 1))
+          # /healthz — ★ the endpoint you should FILTER OUT of telemetry.
+          #   In a real cluster this is 30-70% of all spans. Hit it 3x per loop
+          #   so its dominance is visible, then remove it in Lab 03.
+          curl -s -o /dev/null $APP/healthz
+          curl -s -o /dev/null $APP/healthz
+          curl -s -o /dev/null $APP/healthz
+
+          # A valid product and an INVALID one (404 -> ERROR status span).
+          for p in widget gadget nonexistent-$$i; do
+            curl -s -o /dev/null $APP/products/$p
+          done
+
+          # checkout fails 1 time in 5 inside the app (503 -> ERROR status).
+          curl -s -o /dev/null -X POST $APP/checkout
+
+          sleep 2
+        done
+    depends_on: [checkout]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # THE COLLECTOR. Config validated against otelcol-contrib v0.161.0.
+  # ---------------------------------------------------------------------------
+  collector:
+    # ★ contrib, NOT core: we need prometheus, prometheus_remote_write,
+    #   span_metrics, redaction and resource — none of which are in core.
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    container_name: lab02-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"     # OTLP/gRPC   (what the app uses)
+      - "4318:4318"     # OTLP/HTTP   (what a browser or curl would use)
+      - "8888:8888"     # ★ internal telemetry — defaults to localhost!
+      - "8889:8889"     # prometheus exporter (pull)
+      - "13133:13133"   # health_check
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # ★ Persistent sending_queue storage. Must be writable by uid 65534
+      #   (the collector image's user) — hence the tmpfs-style volume.
+      - otelcol-queue:/var/lib/otelcol
+    # ★ memory_limiter.limit_percentage is relative to THIS limit:
+    #   80% of 1Gi ≈ 819Mi before the limiter starts refusing data.
+    mem_limit: 1g
+    depends_on: [tempo, prometheus, loki]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # BACKENDS. Traces -> Tempo, metrics -> Prometheus, logs -> Loki.
+  # ★ Three specialised stores, one object model each. See ../../13-backends.md
+  # ---------------------------------------------------------------------------
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: lab02-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports:
+      - "3200:3200"     # Tempo HTTP / query API
+      - "4320:4317"     # ★ direct OTLP/gRPC, mapped to 4320 on the host so it
+                        #   does not collide with the Collector's 4317.
+                        #   The app does NOT use this — everything goes via the
+                        #   Collector. Exposed so you can A/B test.
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.7.7
+    container_name: lab02-loki
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    ports: ["3100:3100"]
+    volumes:
+      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: lab02-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-lifecycle
+      - --web.listen-address=0.0.0.0:9090
+      # ★★ REQUIRED for the metric -> trace link. Without it Prometheus accepts
+      #   exemplars but does not RETAIN them, and the diamonds never appear.
+      - --enable-feature=exemplar-storage
+      # Accepts OTLP directly on /api/v1/otlp — an alternative to remote-write.
+      - --web.enable-otlp-receiver
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    container_name: lab02-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_DEFAULT_THEME: light
+      # ★ Tempo/Loki search can be slow on big datasets; raise the timeout so the
+      #   lab does not appear broken.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: ""
+    ports: ["3000:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [tempo, loki, prometheus]
+    restart: unless-stopped
+
+volumes:
+  otelcol-queue:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:

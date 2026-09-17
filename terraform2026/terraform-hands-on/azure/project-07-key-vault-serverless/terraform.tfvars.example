@@ -1,0 +1,7 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project      = "kvl"             # keep it short (vault names max 24 chars)
+environment  = "dev"             # dev | staging | prod
+location     = "eastus"          # a region near you
+secret_value = "dev-api-key-123" # the value to store in the vault

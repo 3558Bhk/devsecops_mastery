@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project     = "cosmos"          # short prefix
+location    = "eastus"          # a region near you
+db_password = "Cosmos-12345!"   # CHANGE THIS — it will live in the Key Vault

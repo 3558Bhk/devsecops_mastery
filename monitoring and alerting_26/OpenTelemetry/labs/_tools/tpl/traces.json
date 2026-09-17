@@ -1,0 +1,33 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "lab-demo-service" } },
+          { "key": "deployment.environment.name", "value": { "stringValue": "lab" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": { "name": "manual.lab", "version": "1.0" },
+          "spans": [
+            {
+              "traceId": "$TRACEID",
+              "spanId": "$SPANID",
+              "name": "GET /demo",
+              "kind": 2,
+              "startTimeUnixNano": "$START",
+              "endTimeUnixNano": "$END",
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/demo" } },
+                { "key": "http.request.method", "value": { "stringValue": "GET" } },
+                { "key": "http.response.status_code", "value": { "intValue": "$CODE" } }
+              ],
+              "status": { "code": "$STATUS" }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

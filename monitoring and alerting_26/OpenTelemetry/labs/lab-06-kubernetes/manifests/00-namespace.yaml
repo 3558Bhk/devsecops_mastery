@@ -1,0 +1,77 @@
+# =============================================================================
+# Lab 06 — Namespace and the RBAC the Collector needs for k8sattributes
+# =============================================================================
+# ★ The k8sattributes processor needs WATCH/LIST on pods. Without this Role it
+#   starts fine and then enriches NOTHING — no error, just missing attributes.
+#   That failure mode is why every "my k8s metadata is empty" ticket exists.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otel-lab
+  labels:
+    name: otel-lab
+    # ★ Enables Pod Security "baseline" enforcement. The Collector needs no
+    #   privileged access; refusing it at admission is free hardening.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: otel-lab
+
+---
+# ★ Least privilege: ONLY what k8sattributes actually reads.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector-k8sattributes
+rules:
+  # k8sattributes with `extract.metadata` needs pods and namespaces.
+  - apiGroups: [""]
+    resources: ["pods", "namespaces"]
+    verbs: ["get", "watch", "list"]
+  # `k8s.deployment.name` / replicaset / statefulset / daemonset resolution
+  # requires reading the owners.
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "watch", "list"]
+  # ★ nodes is needed by resourcedetection's `k8snode` detector, not by
+  #   k8sattributes. Grant it only if you enable that detector.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "watch", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector-k8sattributes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector-k8sattributes
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: otel-lab
+
+---
+# ★★ Collector pods are infrastructure. If they are evicted first during node
+#   pressure you lose telemetry exactly when you need it most (a node under
+#   pressure is usually a node having a problem).
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: otel-collector-critical
+# ★ 1000000000+ is reserved for system-cluster-critical / system-node-critical.
+#   Stay below it but above normal workloads (which default to 0).
+value: 1000000
+globalDefault: false
+description: "OpenTelemetry Collector — evict after system components, before workloads"

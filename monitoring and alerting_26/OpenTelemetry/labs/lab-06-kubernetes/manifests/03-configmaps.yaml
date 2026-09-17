@@ -1,0 +1,761 @@
+# =============================================================================
+# Lab 06 — Collector ConfigMaps
+# =============================================================================
+# ★ GENERATED FROM the machine-validated configs in ../collector-configs/.
+#   agent-config.yaml   -> validated with otelcol-contrib v0.161.0 (cluster-free
+#                          variant; the in-cluster `k8snode` detector needs a real
+#                          service-account token to build, see the note in that file)
+#   gateway-config.yaml -> validated with otelcol-contrib v0.161.0, fully clean
+#
+# ★★ THE THING THAT BITES EVERYONE: changing a ConfigMap does NOT restart the
+#   pods that mount it. Kubernetes propagates the new content to the mounted
+#   file (eventually, up to ~1 minute), but the Collector reads its config ONCE
+#   at startup. So `kubectl apply` succeeds, the ConfigMap updates, and your
+#   running Collectors keep the OLD config indefinitely.
+#
+#   Three ways to actually roll them:
+#     1. ★ The `checksum/config` annotation on the pod template (see the
+#        DaemonSet/StatefulSet). Hash the ConfigMap content into the annotation;
+#        any change alters the pod template and triggers a rollout. This is what
+#        Helm's `{{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}`
+#        idiom does, and what Kustomize's configMapGenerator does automatically
+#        by appending a content hash to the ConfigMap NAME.
+#     2. `kubectl rollout restart daemonset/otel-collector-agent -n otel-lab`
+#     3. The Collector's own confmap HTTP provider + `service.telemetry`
+#        partial-reload (gate service.partialReloadReceivers is TRUE/Beta),
+#        which reloads RECEIVERS without a restart — but not the whole config.
+#
+#   ★ Option 1 is the only one that survives `git pull && kubectl apply`.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-agent-config
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-agent
+    app.kubernetes.io/component: agent
+data:
+  config.yaml: |
+    # =============================================================================
+    # Collector AGENT config (DaemonSet, one per node)
+    # =============================================================================
+    # ★ Does the CHEAP PER-NODE work only: enrichment, detection, filtering, batch.
+    # ★ Does NOT do tail sampling — see 01-agent-daemonset.yaml for why.
+    #
+    # The k8sattributes processor is the reason the agent tier exists at all: it can
+    # see the local kubelet/pod metadata that a central gateway cannot resolve.
+    # =============================================================================
+
+    extensions:
+      health_check:
+        # ★★ MUST be 0.0.0.0. The default is localhost, and the kubelet probes the
+        #    POD IP — so a localhost binding makes every probe fail and Kubernetes
+        #    restart-loops a perfectly healthy Collector.
+        endpoint: 0.0.0.0:13133
+
+      file_storage:
+        directory: /var/lib/otelcol
+        # ★ readOnlyRootFilesystem: true in the pod spec means this directory MUST be
+        #   a writable mounted volume, or the extension fails at startup.
+        create_directory: true
+        timeout: 1s
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+      # ★ Host-level metrics for the NODE itself. Only meaningful in a DaemonSet —
+      #   a central gateway would report its own container's host, which is useless.
+      host_metrics:
+        collection_interval: 30s
+        scrapers:
+          cpu:
+          memory:
+          load:
+          filesystem:
+            # ★ Exclude overlayfs/tmpfs noise from container runtimes.
+            exclude_mount_points:
+              mount_points: ["/var/lib/docker/.*", "/var/lib/kubelet/.*"]
+              match_type: regexp
+          disk:
+          network:
+
+      # ★ Kubernetes EVENTS as logs. Extremely high diagnostic value, very low
+      #   volume. `k8sobjects` watches the API directly — no agent needed per pod.
+      k8s_objects:
+        objects:
+          - name: events
+            mode: watch
+            # ★ Field selector, evaluated SERVER-SIDE. Without it you pull every
+            #   event in the cluster including Normal ones, which is 95% noise.
+            field_selector: type!=Normal
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        # ★★ Relative to the CONTAINER limit (512Mi here), so this fires at ~410Mi.
+        #    Set limit_percentage and the pod's resources.limits.memory TOGETHER.
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      # ---------------------------------------------------------------------------
+      # ★★ k8sattributes — THE reason for an agent tier.
+      #
+      #   Two verified facts that break people:
+      #   1. Gates k8sattributes.DontEmitV0K8sConventions and
+      #      k8sattributes.EmitV1K8sConventions are both TRUE. So you get the v1
+      #      semconv names (k8s.namespace.name, k8s.deployment.name) and NOT the old
+      #      v0 names (k8s.namespace, k8s.deployment). Dashboards written against
+      #      the old names silently return nothing.
+      #   2. It needs RBAC to LIST/WATCH pods. Without it the processor starts fine
+      #      and enriches NOTHING — no error, just absent attributes.
+      #
+      # ★ In a DaemonSet, `filter.node_from_env_var` restricts the watch to pods on
+      #   THIS node. Without it every agent watches EVERY pod in the cluster —
+      #   N agents × full-cluster watch = N× the API server load and memory.
+      # ---------------------------------------------------------------------------
+      k8s_attributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.replicaset.name
+            - k8s.statefulset.name
+            - k8s.daemonset.name
+            - k8s.job.name
+            - k8s.cronjob.name
+            - k8s.node.name
+          # ★★ The key is `tag_name`, NOT `tag`. Verified error if you guess:
+          #     'extract.labels[0]' has invalid keys: tag
+          #   FieldExtractionRule fields are: tag_name, key, from, regex.
+          #   `tag_name` = the ATTRIBUTE name to emit; `key` = the label/annotation
+          #   key to read; `from` = pod | namespace | node.
+          #
+          # ★ Only pull labels you actually query on. Every extracted label is a
+          #   potential index label downstream (and a Loki stream if promoted).
+          labels:
+            - tag_name: app.kubernetes.io/name
+              key: app.kubernetes.io/name
+              from: pod
+            # ★ Map the k8s version label onto the semconv service.version attribute.
+            #   That rename is the whole value of tag_name vs key being separate.
+            - tag_name: service.version
+              key: app.kubernetes.io/version
+              from: pod
+          annotations:
+            - tag_name: team
+              key: otel.team
+              from: pod
+        pod_association:
+          # ★ ORDER MATTERS: most specific first. If `ip` came before the connection
+          #   source, a pod reporting from a NAT'd address would be misattributed.
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: connection
+        filter:
+          # ★★ DaemonSet-scoped watch. See the note above.
+          node_from_env_var: K8S_NODE_NAME
+
+      # ---------------------------------------------------------------------------
+      # ★ resourcedetection fills in what the SDK cannot know.
+      #   `env` reads OTEL_RESOURCE_ATTRIBUTES; `k8snode` needs the node name and
+      #   RBAC on nodes; `system` reads host info.
+      #   ★ override: false means an attribute the SDK already set is NOT clobbered.
+      #     That is usually what you want — the app knows its own service.name.
+      # ---------------------------------------------------------------------------
+      # ★★ VERIFIED — you CANNOT fully `validate` this config outside a cluster.
+      #   The `k8snode` detector builds a real Kubernetes API client at BUILD time,
+      #   so validation fails in layers no matter what env vars you fake:
+      #     1. no env vars at all
+      #          exporters::otlp/gateway: requires a non-empty "endpoint"
+      #          processors::k8sattributes::filter: `node_from_env_var` is configured
+      #            but envvar "K8S_NODE_NAME" is not set
+      #     2. K8S_NODE_NAME + GATEWAY_ENDPOINT set
+      #          failed creating k8snode detector: failed to create K8s API client:
+      #            KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined
+      #     3. those two set as well
+      #          failed to create K8s API client: open
+      #            /var/run/secrets/kubernetes.io/serviceaccount/token:
+      #            no such file or directory
+      #   ★ Layer 3's path is a CONSTANT — not configurable — so there is no way to
+      #     satisfy it without a real mounted service-account token.
+      #
+      #   ★★ The asymmetry worth knowing: `k8sattributes` with
+      #     auth_type: serviceAccount VALIDATES FINE outside a cluster (it defers
+      #     client creation), but `resourcedetection`'s k8snode detector does NOT.
+      #     Removing only `k8snode` from `detectors` makes the whole config validate
+      #     clean — which is the trick for CI: validate a cluster-free variant, and
+      #     let the real one be checked by a canary in-cluster.
+      #
+      #   ★ Also note layer 1's error PREFIX. `exporters::otlp/gateway:` and
+      #     `processors::k8sattributes::filter:` are the `<section>::<component>:`
+      #     form, meaning Validate() ran and rejected the VALUE — as opposed to
+      #     `cannot unmarshal` (schema) or `failed to build pipelines:` (incompatible
+      #     combination). The prefix tells you which stage failed.
+      resource_detection:
+        detectors: [env, k8snode, system]
+        timeout: 5s
+        override: false
+        k8snode:
+          node_from_env_var: K8S_NODE_NAME
+
+      # ★ Drop the noise at the EDGE, before it crosses the network to the gateway.
+      #   Cheapest possible place to reduce volume.
+      filter/edge-noise:
+        error_mode: propagate
+        traces:
+          span:
+            # Health probes and readiness checks — high volume, zero diagnostic value.
+            - 'IsMatch(name, "GET /healthz") or IsMatch(name, "GET /readyz") or IsMatch(name, "GET /livez")'
+            - 'attributes["http.route"] == "/healthz"'
+            - 'attributes["url.path"] == "/healthz"'
+        metrics:
+          datapoint:
+            # ★ High-cardinality identifiers are PROHIBITED on metrics.
+            - 'attributes["user.id"] != nil'
+            - 'attributes["session.id"] != nil'
+
+      # ★ Batch at the agent so the gateway receives fewer, larger payloads.
+      #   This is the single biggest network-cost win in the two-tier design.
+      batch:
+        send_batch_size: 8192
+        send_batch_max_size: 16384
+        timeout: 5s
+
+    exporters:
+      # ---------------------------------------------------------------------------
+      # ★★ LOAD BALANCING LIVES HERE, ON THE ROUTING TIER — not on the gateway.
+      #
+      #   The gateway cannot use this to bridge two of its own pipelines:
+      #   `load_balancing` is registered ONLY as an EXPORTER in v0.161.0 (never as a
+      #   connector or receiver), so writing `receivers: [load_balancing/traces]`
+      #   fails with:
+      #     service::pipelines::traces: references receiver "load_balancing/traces"
+      #     which is not configured
+      #
+      #   ★ WHY ROUTING MUST HAPPEN BEFORE SAMPLING. tail_sampling needs every span
+      #     of a trace in ONE process. With N gateway replicas behind an ordinary
+      #     Kubernetes Service, round-robin spreads one trace across all N; each
+      #     replica sees a FRAGMENT and makes a DIFFERENT decision. You get partial
+      #     traces and a sample rate that means nothing, with NO ERRORS anywhere.
+      #     Consistent traceID routing from this tier is a CORRECTNESS requirement,
+      #     not an optimisation.
+      #
+      #   ★ All agents independently hash the same traceID with the same algorithm,
+      #     so they all agree on which gateway replica owns a trace. No coordination
+      #     needed — that is the elegance of consistent hashing here.
+      #
+      #   ★ resolver.dns needs the HEADLESS Service (clusterIP: None) so DNS returns
+      #     one A record PER POD. A ClusterIP Service returns one virtual IP and the
+      #     load balancer degenerates into a no-op.
+      #   ★ resolver.dns.port is a STRING. Int fails validation.
+      #   ★ routing_key is TOP-LEVEL. `protocol` supports only `otlp`.
+      #   ★ The component was renamed loadbalancing -> load_balancing; the old name
+      #     still parses as a DEPRECATED ALIAS.
+      # ---------------------------------------------------------------------------
+      load_balancing/traces:
+        # ★ traceID => every span of a trace goes to the same gateway replica.
+        routing_key: traceID
+        protocol:
+          otlp:
+            timeout: 30s
+            tls:
+              insecure: true
+            sending_queue:
+              enabled: true
+              queue_size: 5000
+              num_consumers: 10
+              # ★ Disk-backed: a gateway rolling update must not drop the backlog.
+              storage: file_storage
+            retry_on_failure:
+              enabled: true
+              initial_interval: 5s
+              max_interval: 30s
+              max_elapsed_time: 300s
+        resolver:
+          dns:
+            hostname: otel-collector-gateway-headless.otel-lab.svc.cluster.local
+            port: "4317"          # ★★ STRING, not int
+            # ★ Re-resolve often: a rolling update replaces pods, and a stale
+            #   resolution sends traces to a pod that no longer exists.
+            interval: 5s
+            timeout: 10s
+
+      load_balancing/logs:
+        # ★ service => all logs from one service land on the same replica, so Loki
+        #   sees one writer per stream instead of N. Default for logs is already
+        #   `service`; stated explicitly because relying on defaults hides intent.
+        routing_key: service
+        protocol:
+          otlp:
+            timeout: 30s
+            tls:
+              insecure: true
+            sending_queue:
+              enabled: true
+              queue_size: 5000
+              num_consumers: 10
+              storage: file_storage
+            retry_on_failure:
+              enabled: true
+              initial_interval: 5s
+              max_interval: 30s
+              max_elapsed_time: 300s
+        resolver:
+          dns:
+            hostname: otel-collector-gateway-headless.otel-lab.svc.cluster.local
+            port: "4317"
+            interval: 5s
+            timeout: 10s
+
+      load_balancing/metrics:
+        # ★★ streamID, NOT traceID — traceID is INVALID for metrics. streamID is the
+        #   hash of all datapoint attributes + resource + scope + metric identity, so
+        #   the same series always reaches the same replica. That is what makes
+        #   stateful metric processing (delta_to_cumulative) correct across replicas.
+        #
+        #   ★★ metrics routing is ALPHA stability in v0.161.0 (traces and logs are
+        #     Beta). If you need a hard guarantee, route metrics with a plain otlp
+        #     exporter to a single gateway instance instead, and accept the hotspot.
+        routing_key: streamID
+        protocol:
+          otlp:
+            timeout: 30s
+            tls:
+              insecure: true
+            sending_queue:
+              enabled: true
+              queue_size: 5000
+              num_consumers: 10
+              storage: file_storage
+            retry_on_failure:
+              enabled: true
+              initial_interval: 5s
+              max_interval: 30s
+              max_elapsed_time: 300s
+        resolver:
+          dns:
+            hostname: otel-collector-gateway-headless.otel-lab.svc.cluster.local
+            port: "4317"
+            interval: 5s
+            timeout: 10s
+
+      # ★ ON FALLBACKS: you might be tempted to also define a plain `otlp/gateway`
+      #   exporter against the ClusterIP Service, as a safety net for when the
+      #   headless DNS is unresolvable. ★★ DON'T leave it defined but unwired.
+      #   `validate` does NOT flag defined-but-unreferenced components — it passes
+      #   clean — so the dead block silently rots and someone later adds it to a
+      #   pipeline and double-sends every span. If you want a fallback, wire it and
+      #   accept the duplication deliberately.
+
+      debug:
+        verbosity: basic
+        sampling_initial: 2
+        sampling_thereafter: 500
+
+    service:
+      extensions: [health_check, file_storage]
+
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0     # ★ default localhost — invisible to a scraper
+                    port: 8888
+
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - resource_detection
+            - k8s_attributes
+            - filter/edge-noise
+            - batch
+          exporters: [load_balancing/traces, debug]
+
+        metrics:
+          receivers: [otlp, host_metrics]
+          processors:
+            - memory_limiter
+            - resource_detection
+            - k8s_attributes
+            - filter/edge-noise
+            - batch
+          exporters: [load_balancing/metrics, debug]
+
+        logs:
+          receivers: [otlp, k8s_objects]
+          processors:
+            - memory_limiter
+            - resource_detection
+            - k8s_attributes
+            - batch
+          exporters: [load_balancing/logs, debug]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-gateway-config
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-gateway
+    app.kubernetes.io/component: gateway
+data:
+  config.yaml: |
+    # =============================================================================
+    # Collector GATEWAY config (StatefulSet, cluster-wide aggregation point)
+    # =============================================================================
+    # ★ This is where STATEFUL processing lives: tail sampling (needs all spans of a
+    #   trace in one process), load balancing with consistent routing, fan-out, and
+    #   final cardinality control.
+    #
+    # ★★ VALIDATION CAVEAT: this config uses ${env:...} for backend endpoints, so
+    #    `otelcol-contrib validate` needs those env vars set or it fails with:
+    #      exporters::otlp/tempo: requires a non-empty "endpoint"
+    #    Validate with:
+    #      TEMPO_ENDPOINT=t:4317 LOKI_ENDPOINT=http://l:3100/otlp \
+    #      PROM_REMOTE_WRITE=http://p:9090/api/v1/write \
+    #        otelcol-contrib validate --config=gateway-config.yaml
+    # =============================================================================
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133     # ★ 0.0.0.0, not localhost — the kubelet probes the pod IP
+
+      file_storage:
+        directory: /var/lib/otelcol
+        create_directory: true
+        timeout: 1s
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        # ★★ Relative to the CONTAINER limit (2Gi), so this fires at ~1.6Gi.
+        #   Tail sampling alone can hold ~500MB of buffered traces; size the pod
+        #   limit and this percentage TOGETHER or you get OOMKilled instead of shed.
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      # ---------------------------------------------------------------------------
+      # ★★ TAIL SAMPLING. Only valid here, never in the agent tier.
+      #   See ../../10-sampling.md and lab-03 for the full policy semantics.
+      #
+      #   THREE defaults that bite:
+      #     1. If no policy matches, the trace is DROPPED. Always end with a
+      #        catch-all (here: the composite's probabilistic baseline).
+      #     2. decision_cache sizes default to 0 = INACTIVE, so late spans get a
+      #        FRESH INDEPENDENT DECISION and you get partial traces with no error.
+      #     3. num_shards > 1 divides num_traces, cache sizes and per-second limits
+      #        across shards, but does NOT divide burst_capacity — and is
+      #        incompatible with tail_storage.
+      # ---------------------------------------------------------------------------
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 50000
+        # ★ 1 shard. With a StatefulSet each replica samples independently anyway,
+        #   and sharding here would quarter the effective buffer for no gain.
+        num_shards: 1
+        decision_cache:
+          # ★★ Both set WELL ABOVE num_traces (10x). These are the two integers that
+          #   prevent the partial-trace mystery.
+          sampled_cache_size: 500000
+          non_sampled_cache_size: 500000
+
+        policies:
+          # Keep every error, always. This is the policy that pays for the gateway.
+          - name: errors-status
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+
+          # Keep everything slow.
+          - name: slow
+            type: latency
+            latency:
+              threshold_ms: 1000
+
+          # Explicit force-keep for debugging a specific request end to end.
+          - name: force-keep
+            type: boolean_attribute
+            boolean_attribute:
+              key: otel.force_keep
+              value: true
+
+          # ★ Tenant opt-in: a support engineer flips one header and gets 100% of
+          #   their own traffic without changing anyone else's sample rate.
+          - name: tenant-debug
+            type: string_attribute
+            string_attribute:
+              key: tenant.debug
+              values: ["true"]
+
+          # ★★ CATCH-ALL WITH A BUDGET. Sub-policies share max_total_spans_per_second
+          #   and each gets a rate_allocation percentage (must sum to 100).
+          - name: budget
+            type: composite
+            composite:
+              max_total_spans_per_second: 5000
+              policy_order: [errors-baseline, slow-baseline, everything-else]
+              composite_sub_policy:
+                - name: errors-baseline
+                  type: status_code
+                  status_code:
+                    status_codes: [ERROR]
+                - name: slow-baseline
+                  type: latency
+                  latency:
+                    threshold_ms: 500
+                # ★ The residual share. Without this sub-policy the composite drops
+                #   everything that is neither an error nor slow.
+                - name: everything-else
+                  type: always_sample
+              # ★★ VERIFIED — `percent` lives ONLY here, under rate_allocation.
+              #   Putting it inside composite_sub_policy fails validation with a
+              #   genuinely confusing message:
+              #     'policies[4].composite.composite_sub_policy[0][<interface {} Value>]'
+              #     expected type 'map[string]interface {}', got unconvertible type 'int'
+              #   ★ Read that error properly: it says a VALUE inside the sub-policy
+              #     map should have been a MAP but was an INT. It never names the
+              #     offending key (`percent`), because the decoder is walking the
+              #     generic policy struct. This class of error means "extra key whose
+              #     value is a scalar where the schema expects a nested block".
+              #   Sub-policies take only name/type/<type-specific block>.
+              #   ★ Percentages should sum to 100; the remainder is simply unused
+              #     capacity, not an error.
+              rate_allocation:
+                - percent: 40
+                  policy: errors-baseline
+                - percent: 30
+                  policy: slow-baseline
+                - percent: 30
+                  policy: everything-else
+
+      # ★ Final cardinality guard before the backend. Layer 3 of 5.
+      #   error_mode defaults to `ignore` (gate TRUE/Stable) — a malformed condition
+      #   is swallowed and the filter silently does nothing. Use propagate.
+      filter/gateway-noise:
+        error_mode: propagate
+        metrics:
+          datapoint:
+            - 'attributes["k8s.pod.uid"] != nil'      # ★ pod UID is unbounded
+            - 'attributes["user.id"] != nil'
+
+      batch:
+        send_batch_size: 8192
+        send_batch_max_size: 16384
+        timeout: 5s
+
+    connectors:
+      span_metrics:
+        histogram:
+          explicit:
+            buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+        # ★ service.name / service.instance.id are DEFAULT dimensions — re-listing
+        #   fails with "duplicate dimension name".
+        dimensions:
+          - name: http.route
+          - name: k8s.namespace.name
+          - name: k8s.deployment.name
+        aggregation_cardinality_limit: 2000
+        aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+        metrics_expiration: 10m
+
+    exporters:
+      # ---------------------------------------------------------------------------
+      # ★★ WHY THERE IS NO load_balancing EXPORTER IN THIS CONFIG.
+      #
+      #   The obvious design is wrong, and `validate` catches it. You might write:
+      #
+      #     traces/lb:      receivers: [otlp]                  exporters: [load_balancing/traces]
+      #     traces/sample:  receivers: [load_balancing/traces] exporters: [otlp/tempo]
+      #
+      #   treating load_balancing as a CONNECTOR that hands off between two
+      #   pipelines in one process — the way span_metrics does. It fails:
+      #
+      #     service::pipelines::logs: references receiver "load_balancing/logs"
+      #     which is not configured
+      #
+      #   ★ VERIFIED against components-0.161.0.yaml: load_balancing appears ONLY
+      #     under `exporters` (stability: traces Beta, metrics Alpha, logs Beta).
+      #     It is in NEITHER `connectors` NOR `receivers`. So it cannot be a
+      #     pipeline-to-pipeline bridge, and cannot be a receiver at all.
+      #
+      #   ★ WHAT IT ACTUALLY IS: an exporter that sends data over the NETWORK to a
+      #     set of OTHER Collector instances, choosing the destination by a
+      #     consistent hash. It belongs on the tier that ROUTES, not the tier that
+      #     SAMPLES — in this lab, on the AGENT (see ../../collector-configs/
+      #     agent-config.yaml), pointing at this gateway's headless Service.
+      #
+      #   ★ THE DEEPER POINT, and the reason this matters for correctness:
+      #     tail sampling needs every span of a trace in ONE process. With N gateway
+      #     replicas behind an ordinary Kubernetes Service, round-robin spreads one
+      #     trace's spans across all N. Each replica sees a FRAGMENT and makes a
+      #     DIFFERENT decision. Result: partial traces and a sample rate that means
+      #     nothing — with no errors anywhere.
+      #     Routing by traceID from the agent tier is what makes the gateway tier
+      #     correct. It is not an optimisation; it is a correctness requirement.
+      #
+      #   ★ VERIFIED routing_key values and the signals they are valid for:
+      #       service    -> spans, logs, metrics
+      #       traceID    -> spans, logs            (INVALID for metrics)
+      #       resource   -> logs, metrics
+      #       metric     -> metrics only           (INVALID for spans/logs)
+      #       streamID   -> metrics only
+      #       attributes -> spans, logs, metrics   (requires routing_attributes)
+      #     Defaults when unset: traceID for traces; service for logs AND metrics.
+      #
+      #   ★ `routing_key` is TOP-LEVEL, not nested under `protocol`. `protocol`
+      #     supports only `otlp`.
+      #   ★ resolver.dns.port must be a STRING ("4317"), not an int. Every other port
+      #     in a Collector config is an int. Pure schema trap:
+      #       'resolver.dns' decoding failed: 'port' expected type 'string',
+      #       got unconvertible type 'int'
+      #   ★ From the README: "either the Trace ID or Service name is used for the
+      #     decision on which backend to use: THE ACTUAL BACKEND LOAD ISN'T TAKEN
+      #     INTO CONSIDERATION." This is consistent hashing, not least-connections.
+      #     A hot service under `service` routing pins ALL its traffic to ONE
+      #     replica. Use `attributes` routing to split an overwhelming service.
+      #   ★ resolver.dns needs a HEADLESS Service (clusterIP: None) so DNS returns
+      #     one A record per pod. A ClusterIP Service returns ONE virtual IP and the
+      #     load balancer sees a single "backend" — routing degenerates to no-op.
+      #   ★ metrics routing is ALPHA stability in v0.161.0. Pin your expectations.
+      # ---------------------------------------------------------------------------
+
+      # ---- Final backends -------------------------------------------------------
+      # ★ BARE host:port for gRPC. `validate` does NOT catch a scheme-prefixed
+      #   endpoint (`http://host:4317` passes silently) but it fails at runtime.
+      otlp/tempo:
+        endpoint: ${env:TEMPO_ENDPOINT}
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 20000
+          num_consumers: 10
+          storage: file_storage       # ★ survives a rolling update
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s      # ★ bounded on purpose
+        timeout: 30s
+
+      # ★★ Loki. There is NO `loki` exporter in contrib v0.161.0 — it was removed.
+      #   `endpoint` is the BASE; the exporter appends `/v1/logs` itself.
+      otlphttp/loki:
+        endpoint: ${env:LOKI_ENDPOINT}
+        encoding: proto
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 20000
+          num_consumers: 10
+          storage: file_storage
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        timeout: 30s
+
+      prometheus_remote_write/prom:
+        endpoint: ${env:PROM_REMOTE_WRITE}
+        sending_queue:
+          enabled: true
+          queue_size: 20000
+          num_consumers: 10
+          storage: file_storage
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        # ★ Verified gate: exporter.prometheusremotewritexporter.RetryOn429 is FALSE
+        #   by default, so a rate-limiting backend's 429s are NOT retried. Enable the
+        #   gate if your backend throttles.
+        resource_to_telemetry_conversion:
+          enabled: false              # ★ false: true promotes every resource attr to a label
+
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        translation_strategy: UnderscoreEscapingWithSuffixes
+        send_timestamps: true
+        metric_expiration: 10m
+        enable_open_metrics: true
+        resource_to_telemetry_conversion:
+          enabled: false
+
+      debug:
+        verbosity: basic
+        sampling_initial: 2
+        sampling_thereafter: 500
+
+    service:
+      extensions: [health_check, file_storage]
+
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+
+      pipelines:
+        # -------------------------------------------------------------------------
+        # ★ ONE pipeline per signal. The agent tier already routed each trace to a
+        #   specific gateway replica, so everything arriving here is a COMPLETE
+        #   trace. That is the precondition tail_sampling depends on, and it is
+        #   established one tier earlier — not here.
+        # -------------------------------------------------------------------------
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, tail_sampling, filter/gateway-noise, batch]
+          exporters: [otlp/tempo, span_metrics, debug]
+
+        metrics:
+          # ★ span_metrics is a CONNECTOR, so it legitimately appears as an exporter
+          #   in `traces` and as a receiver here. Connectors bridge pipelines;
+          #   exporters do not. That asymmetry is the whole lesson above.
+          receivers: [otlp, span_metrics]
+          processors: [memory_limiter, filter/gateway-noise, batch]
+          exporters: [prometheus_remote_write/prom, prometheus, debug]
+
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlphttp/loki, debug]

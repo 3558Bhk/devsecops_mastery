@@ -1,0 +1,359 @@
+# Kubernetes alerting. Requires kube-state-metrics (KSM) + kubelet/cAdvisor.
+# Namespace/workload labels are assumed to be `namespace`, `pod`, `deployment`, `node`.
+groups:
+  - name: kubernetes-nodes
+    rules:
+      - alert: KubeNodeNotReady
+        expr: |
+          kube_node_status_condition{condition="Ready", status="true"} == 0
+        for: 5m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "Node {{ $labels.node }} has been NotReady for 5m"
+          description: "Workloads on this node are being evicted or are unschedulable."
+          runbook: "https://runbooks.example.com/k8s/node-notready"
+
+      - alert: KubeNodeUnreachable
+        expr: |
+          kube_node_spec_taint{key="node.kubernetes.io/unreachable", effect="NoSchedule"} == 1
+        for: 5m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "Node {{ $labels.node }} is unreachable from the control plane"
+
+      - alert: KubeNodeMemoryPressure
+        expr: kube_node_status_condition{condition="MemoryPressure", status="true"} == 1
+        for: 10m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "Node {{ $labels.node }} reports MemoryPressure"
+
+      - alert: KubeNodeDiskPressure
+        expr: kube_node_status_condition{condition="DiskPressure", status="true"} == 1
+        for: 10m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "Node {{ $labels.node }} reports DiskPressure — pods will be evicted"
+
+      - alert: KubeNodePIDPressure
+        expr: kube_node_status_condition{condition="PIDPressure", status="true"} == 1
+        for: 10m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "Node {{ $labels.node }} is running out of PIDs"
+
+      - alert: KubeNodeCpuOvercommitted
+        expr: |
+          sum by (node) (kube_pod_container_resource_requests{resource="cpu"})
+            / sum by (node) (kube_node_status_allocatable{resource="cpu"}) > 0.90
+        for: 30m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "Node {{ $labels.node }} CPU requests at {{ $value | humanizePercentage }} of allocatable"
+
+      - alert: KubeVersionMismatch
+        expr: |
+          count by (namespace) (count by (git_version, namespace) (label_replace(
+            kubernetes_build_info{job!~"kube-dns|coredns"}, "git_version", "$1", "git_version", "(v[0-9]*.[0-9]*).*"))) > 1
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "There are {{ $value }} different Kubernetes component versions running"
+
+  - name: kubernetes-workloads
+    rules:
+      - alert: KubeDeploymentReplicasMismatch
+        expr: |
+          kube_deployment_spec_replicas
+            != kube_deployment_status_replicas_available
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.deployment }} has {{ $value }} unavailable replicas"
+
+      - alert: KubeDeploymentAtZeroReplicas
+        expr: kube_deployment_status_replicas_available == 0
+        for: 5m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.deployment }} has ZERO available replicas"
+          description: "The service is down. Check pod events, image pull, probes and quota."
+          runbook: "https://runbooks.example.com/k8s/zero-replicas"
+
+      - alert: KubeStatefulSetReplicasMismatch
+        expr: |
+          kube_statefulset_status_replicas_ready != kube_statefulset_status_replicas
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.statefulset }} statefulset not fully ready"
+
+      - alert: KubeStatefulSetGenerationMismatch
+        expr: |
+          kube_statefulset_status_observed_generation != kube_statefulset_metadata_generation
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.statefulset }} rollout is stuck"
+
+      - alert: KubePodNotReady
+        # Pods that are neither Succeeded nor Failed, and still not Ready.
+        expr: |
+          sum by (namespace, pod) (
+            max by (namespace, pod) (
+              kube_pod_status_phase{phase!~"Succeeded|Failed"} == 1
+            ) * on(namespace, pod) group_left()
+            max by (namespace, pod) (
+              kube_pod_status_ready{condition="true"} == 0
+            )
+          ) > 0
+        for: 20m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }} has not been ready for 20m"
+          description: |
+            `kubectl -n {{ $labels.namespace }} describe pod {{ $labels.pod }}` —
+            look at Conditions, Events, and readiness probe failures.
+
+      - alert: KubePodPendingTooLong
+        expr: kube_pod_status_phase{phase="Pending"} == 1
+        for: 20m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }} has been Pending for 20m"
+          description: "Usually insufficient resources, a missing PVC, or node selectors/taints."
+
+      - alert: KubePodCrashLooping
+        expr: |
+          rate(kube_pod_container_status_restarts_total[15m]) * 60 * 15 > 3
+        for: 5m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} is crash-looping"
+          description: "Check `kubectl logs --previous` and the container's last terminated reason."
+          runbook: "https://runbooks.example.com/k8s/crashloop"
+
+      - alert: KubeContainerOOMKilled
+        expr: |
+          increase(kube_pod_container_status_terminated_reason{reason="OOMKilled"}[15m]) > 0
+        for: 0m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} was OOMKilled"
+          description: "Raise the memory limit or fix the leak. Working set was near the limit beforehand."
+
+      - alert: KubeContainerWaiting
+        expr: |
+          sum by (namespace, pod, container, reason) (kube_pod_container_status_waiting_reason) > 0
+        for: 30m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} waiting: {{ $labels.reason }}"
+
+      - alert: KubeImagePullBackOff
+        expr: |
+          sum by (namespace, pod) (kube_pod_container_status_waiting_reason{reason="ImagePullBackOff"}) > 0
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }} cannot pull its image"
+
+      - alert: KubeJobFailed
+        expr: kube_job_status_failed > 0
+        for: 5m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "Job {{ $labels.namespace }}/{{ $labels.job_name }} has {{ $value }} failed pods"
+
+      - alert: KubeJobNotCompleting
+        expr: |
+          kube_job_spec_completions > 0
+            and (kube_job_status_succeeded < kube_job_spec_completions)
+            and (time() - kube_job_status_start_time > 3600)
+        for: 10m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "Job {{ $labels.namespace }}/{{ $labels.job_name }} has been running >1h without completing"
+
+      - alert: KubeHPAAtMaxReplicas
+        expr: |
+          kube_horizontalpodautoscaler_status_current_replicas
+            >= kube_horizontalpodautoscaler_spec_max_replicas
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "HPA {{ $labels.namespace }}/{{ $labels.horizontalpodautoscaler }} is saturated at max replicas"
+          description: "Autoscaling can no longer absorb load. Raise the max or scale the bottleneck."
+
+      - alert: KubeHPACannotScaleUp
+        expr: |
+          kube_horizontalpodautoscaler_status_condition{condition="ScalingActive", status="false"} == 1
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "HPA {{ $labels.horizontalpodautoscaler }} is not able to scale (missing metrics?)"
+
+      - alert: KubeQuotaAlmostFull
+        expr: |
+          kube_resourcequota{type="used"}
+            / on(namespace, resource, type) group_left()
+          kube_resourcequota{type="hard"} > 0.90
+        for: 30m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }} quota {{ $labels.resource }} at {{ $value | humanizePercentage }}"
+
+  - name: kubernetes-storage
+    rules:
+      - alert: KubePersistentVolumeFillingUp
+        expr: |
+          kubelet_volume_stats_available_bytes{namespace!~"kube-system"}
+            / clamp_min(kubelet_volume_stats_capacity_bytes, 1) < 0.10
+        for: 10m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} has {{ $value | humanizePercentage }} free"
+          runbook: "https://runbooks.example.com/k8s/pvc-full"
+
+      - alert: KubePersistentVolumeWillFillIn4Hours
+        expr: |
+          predict_linear(kubelet_volume_stats_available_bytes[6h], 4 * 3600) < 0
+        for: 30m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} projected full within 4h"
+
+      - alert: KubePersistentVolumeInodesFillingUp
+        expr: |
+          kubelet_volume_stats_inodes_used / clamp_min(kubelet_volume_stats_inodes, 1) > 0.90
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "PVC {{ $labels.persistentvolumeclaim }} inodes {{ $value | humanizePercentage }} used"
+
+      - alert: KubePersistentVolumeClaimPending
+        expr: kube_persistentvolumeclaim_status_phase{phase="Pending"} == 1
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is stuck Pending"
+
+      - alert: KubePersistentVolumeErrors
+        expr: |
+          kube_persistentvolume_status_phase{phase=~"Failed|Pending"} == 1
+        for: 10m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "PV {{ $labels.persistentvolume }} is in phase {{ $labels.phase }}"
+
+  - name: kubernetes-control-plane
+    rules:
+      - alert: KubeAPIServerHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, verb, resource) (
+              rate(apiserver_request_duration_seconds_bucket{verb!~"WATCH|LIST|CONNECT"}[5m])))
+            > 1
+        for: 10m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "API server p99 for {{ $labels.verb }} {{ $labels.resource }} is {{ $value | humanizeDuration }}"
+
+      - alert: KubeAPIServerErrorRate
+        expr: |
+          sum by (job) (rate(apiserver_request_total{code=~"5.."}[5m]))
+            / clamp_min(sum by (job) (rate(apiserver_request_total[5m])), 1e-9) > 0.03
+        for: 10m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "API server 5xx rate {{ $value | humanizePercentage }}"
+
+      - alert: KubeAPIServerDown
+        expr: absent(up{job="apiserver"} == 1)
+        for: 5m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "No healthy kube-apiserver target"
+
+      - alert: KubeletTooManyErrors
+        expr: |
+          sum by (node) (rate(kubelet_runtime_operations_errors_total[5m]))
+            / clamp_min(sum by (node) (rate(kubelet_runtime_operations_total[5m])), 1e-9) > 0.05
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "kubelet on {{ $labels.node }} runtime operation error rate {{ $value | humanizePercentage }}"
+
+      - alert: KubeletPLEGUnhealthy
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, node) (rate(kubelet_pleg_relist_duration_seconds_bucket[5m]))) > 10
+        for: 10m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "kubelet PLEG relist p99 on {{ $labels.node }} is {{ $value }}s — node will go NotReady"
+
+      - alert: KubeletPodStartLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, node) (rate(kubelet_pod_start_duration_seconds_bucket[5m]))) > 60
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "Pods on {{ $labels.node }} take {{ $value | humanizeDuration }} (p99) to start"
+
+      - alert: KubeClientCertificateExpiring
+        expr: |
+          apiserver_client_certificate_expiration_seconds_count{job="apiserver"} > 0
+            and
+          histogram_quantile(0.01,
+            sum by (le, job) (rate(apiserver_client_certificate_expiration_seconds_bucket{job="apiserver"}[5m])))
+            < 7 * 24 * 3600
+        for: 10m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "A client certificate used by the API server expires within 7 days"
+
+      - alert: KubeCoreDNSNotReady
+        expr: |
+          sum(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"})
+            < sum(kube_deployment_spec_replicas{namespace="kube-system", deployment="coredns"})
+        for: 10m
+        labels: {severity: page, team: platform}
+        annotations:
+          summary: "CoreDNS is not fully available — in-cluster DNS resolution will fail"
+
+  - name: kubernetes-resources
+    rules:
+      - alert: ContainerCPUThrottlingHigh
+        expr: |
+          sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_periods_total[5m]))
+            / clamp_min(sum by (namespace, pod, container) (rate(container_cpu_cfs_periods_total[5m])), 1) > 0.50
+        for: 15m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} throttled {{ $value | humanizePercentage }} of periods"
+          description: |
+            Throttling causes latency even when average CPU looks low. Raise the CPU limit
+            or remove it (requests-only), and check for bursty single-threaded work.
+
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          container_memory_working_set_bytes{container!="", container!="POD"}
+            / on(namespace, pod, container) group_left()
+          kube_pod_container_resource_limits{resource="memory"} > 0.90
+        for: 10m
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} memory at {{ $value | humanizePercentage }} of limit"
+          description: "OOMKill is imminent. Raise the limit or investigate growth."
+
+      - alert: PodNoResourceRequests
+        expr: |
+          count by (namespace, pod) (kube_pod_container_info) > 0
+            unless on(namespace, pod)
+          count by (namespace, pod) (kube_pod_container_resource_requests) > 0
+        for: 1h
+        labels: {severity: ticket, team: platform}
+        annotations:
+          summary: "{{ $labels.namespace }}/{{ $labels.pod }} has containers with no resource requests"

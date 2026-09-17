@@ -1,0 +1,183 @@
+# =============================================================================
+# Lab 03 — Head vs tail sampling, side by side
+# =============================================================================
+#   docker compose up -d --build
+#
+#   Grafana            http://localhost:3000   (admin / admin)
+#   Tempo              http://localhost:3200
+#   Prometheus         http://localhost:9090
+#   Collector OTLP     localhost:4317/4318  -> HEAD sampling path  (app-head)
+#                      localhost:4417/4418  -> TAIL sampling path  (app-tail)
+#
+#   docker compose down -v
+#
+# ★ The first build reuses ../lab-02-instrumented-app/app, so run Lab 02 first
+#   (or just let this build it — same image, different container).
+#
+# THE EXPERIMENT: both apps run IDENTICAL code and generate IDENTICAL traffic.
+# The only difference is which sampling path they take. Compare what survives.
+# =============================================================================
+
+name: otel-lab-03
+
+# ★ Shared env for both app instances. Only OTEL_SERVICE_NAME and the exporter
+#   endpoint differ — which is the whole point: same code, different sampler.
+x-app-common: &app-common
+  build: ../lab-02-instrumented-app/app
+  environment: &app-env
+    OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+    OTEL_TRACES_EXPORTER: otlp
+    OTEL_METRICS_EXPORTER: otlp
+    OTEL_LOGS_EXPORTER: otlp
+    OTEL_RESOURCE_ATTRIBUTES: "deployment.environment.name=lab,service.version=1.0.0"
+    OTEL_BSP_SCHEDULE_DELAY: "2000"
+    OTEL_METRIC_EXPORT_INTERVAL: "10000"
+    OTEL_PROPAGATORS: tracecontext,baggage
+    OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------------------
+  # PATH A — HEAD SAMPLING.
+  #
+  # ★★ The SDK samples 100% and the COLLECTOR does the head sampling here, so
+  #   that both paths run in one Collector and are directly comparable. In
+  #   production you would set OTEL_TRACES_SAMPLER=parentbased_traceidratio with
+  #   ARG=0.1 in the app instead, and drop spans before they are serialised —
+  #   strictly cheaper. See ../../09-sdks-and-instrumentation.md
+  #
+  #   Note OTEL_TRACES_SAMPLER is deliberately parentbased_always_on: the SDK
+  #   keeps everything so the Collector's probabilistic_sampler is the ONLY
+  #   thing deciding. Two samplers in series multiply, which is a classic way to
+  #   accidentally sample 1% instead of 10%.
+  # ---------------------------------------------------------------------------
+  app-head:
+    <<: *app-common
+    container_name: lab03-app-head
+    image: lab03-app-head:latest
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: head-sampled-service
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      PAYMENTS_URL: http://app-head:8000/payments
+    depends_on: [collector]
+
+  # ---------------------------------------------------------------------------
+  # PATH B — TAIL SAMPLING. Identical code and traffic; different decision point.
+  # ---------------------------------------------------------------------------
+  app-tail:
+    <<: *app-common
+    container_name: lab03-app-tail
+    image: lab03-app-tail:latest
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: tail-sampled-service
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4417
+      PAYMENTS_URL: http://app-tail:8000/payments
+    depends_on: [collector]
+
+  # One load generator driving BOTH apps identically.
+  loadgen:
+    image: alpine:3.21
+    container_name: lab03-loadgen
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl >/dev/null
+        i=0
+        echo "Driving IDENTICAL traffic to app-head and app-tail every 2s"
+        while true; do
+          i=$((i + 1))
+          for APP in http://app-head:8000 http://app-tail:8000; do
+            # ★ healthz x3 — high-volume, low-value. Tail sampling keeps it at
+            #   the baseline rate; head sampling keeps 10% of it blindly.
+            curl -s -o /dev/null $APP/healthz
+            curl -s -o /dev/null $APP/healthz
+            curl -s -o /dev/null $APP/healthz
+
+            # A valid product and an invalid one (404 -> ERROR status span).
+            # ★ Tail sampling keeps 100% of these. Head sampling keeps 10%.
+            curl -s -o /dev/null $APP/products/widget
+            curl -s -o /dev/null $APP/products/nonexistent-$$i
+
+            # checkout fails 1 in 5 inside the app (503 -> ERROR status).
+            curl -s -o /dev/null -X POST $APP/checkout
+          done
+          sleep 2
+        done
+    depends_on: [app-head, app-tail]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ★ 2Gi limit, not 512Mi. tail_sampling holds up to num_traces (50,000) traces
+  #   in memory plus two 500k-entry decision caches. memory_limiter fires at 80%
+  #   of THIS limit (~1.6Gi). Size the container limit and limit_percentage
+  #   TOGETHER — see ../../12-collector-in-kubernetes.md
+  # ---------------------------------------------------------------------------
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    container_name: lab03-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"     # OTLP/gRPC  -> HEAD path
+      - "4318:4318"     # OTLP/HTTP  -> HEAD path
+      - "4417:4417"     # OTLP/gRPC  -> TAIL path
+      - "4418:4418"     # OTLP/HTTP  -> TAIL path
+      - "8888:8888"     # internal telemetry (★ must be detailed for per-policy metrics)
+      - "8889:8889"     # prometheus exporter
+      - "13133:13133"   # health_check
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    mem_limit: 2g
+    depends_on: [tempo]
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: lab03-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports: ["3200:3200"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: lab03-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=1d
+      - --web.enable-lifecycle
+      - --web.listen-address=0.0.0.0:9090
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    container_name: lab03-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_DEFAULT_THEME: light
+    ports: ["3000:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [tempo, prometheus]
+    restart: unless-stopped
+
+volumes:
+  tempo-data:
+  prometheus-data:
+  grafana-data:

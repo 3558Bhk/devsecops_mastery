@@ -1,0 +1,255 @@
+{
+  "uid": "lab04-metrics",
+  "title": "Lab 04 — Metrics & Prometheus",
+  "description": "Temporality, naming transformation, pull-vs-push, and the four cardinality layers. Companion reading: 06-metrics.md and 14-scale-cost-and-cardinality.md. Every metric name here is the POST-transformation Prometheus name.",
+  "tags": ["opentelemetry", "lab-04", "metrics", "prometheus"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "1. Naming transformation — the OTel name is NOT the Prometheus name",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "id": 400
+    },
+    {
+      "type": "stat",
+      "title": "Does the transformed name resolve at all?",
+      "description": "Four series that only exist under their POST-transformation names. If any shows No data, you are querying an OTel name that Prometheus has renamed. http.server.request.duration -> http_server_request_duration_seconds_bucket (dots to underscores + _seconds unit + _bucket histogram suffix). traces.span.metrics.calls -> traces_span_metrics_calls_total (+_total counter suffix).",
+      "id": 1,
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "orientation": "horizontal" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(traces_span_metrics_calls_total[2m]))", "legendFormat": "traces_span_metrics_calls_total" },
+        { "refId": "B", "expr": "sum(rate(http_server_request_duration_seconds_count[2m]))", "legendFormat": "http_server_request_duration_seconds_count" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ span_metrics (ms) vs service_graph (s) — same latency, 1000x apart",
+      "description": "TWO CONNECTORS IN ONE PIPELINE REPORT LATENCY IN DIFFERENT UNITS. span_metrics uses MILLISECONDS because connector.spanmetrics.useSecondAsDefaultMetricsUnit is FALSE by default. service_graph uses SECONDS because connector.servicegraph.legacyLatencyUnitMs is FALSE. Any dashboard assuming one unit for both is off by 1000x. Enable either gate and the numbers silently shift.",
+      "id": 2,
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))",
+          "legendFormat": "span_metrics p99 (MILLISECONDS)"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_service_graph_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "service_graph p99 (SECONDS)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "2. ★★ TEMPORALITY — the silent correctness trap",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
+      "collapsed": false,
+      "id": 401
+    },
+    {
+      "type": "timeseries",
+      "title": "★★ Counter monotonicity — if this is NOT a smooth ramp, temporality is wrong",
+      "description": "A CUMULATIVE counter only ever increases (until a reset, which shows as one clean drop). DELTA data arriving at a cumulative-expecting store looks like a constant sawtooth: it appears to reset on every export interval and rate() returns nonsense -- usually LOWER than reality. NOTHING ERRORS. Prometheus accepts it, Grafana renders it, the Collector logs are clean. Fix: add the delta_to_cumulative processor.",
+      "id": 3,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2, "showPoints": "auto", "pointSize": 4 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(traces_span_metrics_calls_total{service_name=\"checkout-service\"})", "legendFormat": "cumulative total (should ramp smoothly)" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ Counter resets per minute — a spike means delta is leaking through",
+      "description": "resets() counts how many times Prometheus saw a counter go BACKWARDS in the window. For genuinely cumulative data from a stable process this should be near zero. A sustained non-zero value is the signature of delta data reaching a cumulative store -- the single most common cause of quietly wrong dashboards.",
+      "id": 4,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "resets(sum(traces_span_metrics_calls_total{service_name=\"checkout-service\"})[5m:1m])", "legendFormat": "counter resets in 5m" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "3. Pull vs Push — running both doubles your ingest",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false,
+      "id": 402
+    },
+    {
+      "type": "timeseries",
+      "title": "★ The same data by two paths (distinguished by job label)",
+      "description": "PATH B is pull: Prometheus scrapes collector:8889 (job otel-collector-export). PATH B' is push: the Collector remote-writes to /api/v1/write. Both are on, so series exist twice with different labels. Pick ONE permanently -- running both doubles ingest and gives you two series sets that disagree slightly (different scrape times, different relabelling, and only the push path carries exemplars).",
+      "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (__name__, job) ({job=\"otel-collector-export\"}))",
+          "legendFormat": "distinct series via PULL (job=otel-collector-export)"
+        },
+        {
+          "refId": "B",
+          "expr": "count(count by (__name__, job) ({job=\"scraped-by-collector\"}))",
+          "legendFormat": "distinct series via COLLECTOR SCRAPE (job=scraped-by-collector)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Scrape health and refusals (a failed scrape is LOUD; a misnamed metric is not)",
+      "description": "Exercise 5 repoints the Collector's prometheus/app receiver at the FastAPI app, which has NO /metrics endpoint -- so the scrape fails. That failure is visible here and in the Collector logs. Contrast with the naming and temporality traps, which produce no error at all. Prefer failure modes that announce themselves.",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "up", "legendFormat": "up {{job}}" },
+        { "refId": "B", "expr": "sum(rate(otelcol_receiver_refused_metric_points[2m]))", "legendFormat": "metric points refused/s" },
+        { "refId": "C", "expr": "sum(rate(otelcol_exporter_send_failed_metric_points[2m]))", "legendFormat": "metric points send_failed/s" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "4. Cardinality — the four layers, cheapest first",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "collapsed": false,
+      "id": 403
+    },
+    {
+      "type": "stat",
+      "title": "★ Total active series (this number is your bill)",
+      "description": "Layer 5 -- the backend -- is the MOST EXPENSIVE place to discover a cardinality problem. Layers 1-4 (connector limit, view limit, filter/transform, cardinality_guardian) all cost far less to fix. This lab sets BOTH the connector limit and the view limit to 1000; Exercise 4 drops the view limit to 10 to show that view is a BLUNT GLOBAL CAP affecting every metric in every pipeline.",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 100000 },
+              { "color": "red", "value": 1000000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        { "refId": "A", "expr": "count({__name__!=\"\"})", "legendFormat": "active series" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Top series by label-set size (find the dimension that exploded)",
+      "description": "Group by metric name and count distinct label combinations. The biggest offender is almost always an attribute that should have been a high-cardinality PROHIBITED identifier (user.id, session.id, order.id) leaking into a metric attribute. The filter/metric-noise processor drops exactly those datapoints -- and transform/reduce-status collapses status codes to 2xx/3xx/4xx/5xx to reduce a dimension instead of dropping data.",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 50 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "topk(10, count by (__name__) ({__name__=~\"traces_span_metrics.*|http_server_request_duration_seconds_bucket|trace_span_count\"}))", "legendFormat": "{{__name__}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connector-level limit enforcement",
+      "description": "Layer 1: span_metrics.aggregation_cardinality_limit (set to 1000). Layer 2: the global view limit (also 1000, but it applies to ALL metrics in ALL pipelines -- a blunt instrument). dimensions_cache_size still parses but is DEPRECATED; aggregation_cardinality_limit is the replacement. Both keys exist in the source Config struct, which is why the old one does not error.",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "count(count by (service_name, span_name, http_route) (traces_span_metrics_calls_total))", "legendFormat": "span_metrics dimension sets" },
+        { "refId": "B", "expr": "1000", "legendFormat": "aggregation_cardinality_limit" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pipeline throughput (metrics in vs out)",
+      "description": "The gap between accepted and sent IS what your filter/transform/delta_to_cumulative chain removed or aggregated. If dropped is non-zero, something is discarding data before export -- and that is cheaper than the backend discarding it, which is the whole argument for layers 1-4.",
+      "id": 10,
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "lab04-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(otelcol_receiver_accepted_metric_points[1m]))", "legendFormat": "accepted" },
+        { "refId": "B", "expr": "sum(rate(otelcol_exporter_sent_metric_points[1m]))", "legendFormat": "sent" },
+        { "refId": "C", "expr": "sum(rate(otelcol_processor_dropped_metric_points[1m]))", "legendFormat": "dropped by processors" },
+        { "refId": "D", "expr": "sum(rate(otelcol_receiver_refused_metric_points[1m]))", "legendFormat": "refused" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+# Base recording rules — most other rule files in this library depend on these.
+# Install first. Adjust `job`/`service` label names to match your estate.
+groups:
+  - name: base.recording
+    interval: 30s
+    rules:
+      # ── Availability ────────────────────────────────────────────────────
+      - record: job:up:mean5m
+        expr: avg_over_time(up[5m])
+
+      - record: job:up:ratio
+        expr: avg by (job) (up)
+
+      # ── HTTP RED (assumes http_requests_total{job,status} and
+      #    http_request_duration_seconds_bucket{job,le}) ───────────────────
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:http_requests:rate5m_by_status
+        expr: sum by (job, status) (rate(http_requests_total[5m]))
+
+      - record: job:http_errors:rate5m
+        expr: sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+
+      # Error RATIO (0..1). clamp_min avoids NaN on zero traffic — a NaN
+      # comparison is false, so the alert correctly does not fire when idle.
+      - record: job:http_error_ratio:rate5m
+        expr: |
+          job:http_errors:rate5m
+            / clamp_min(job:http_requests:rate5m, 1e-9)
+
+      - record: job:http_request_duration_seconds:p50
+        expr: |
+          histogram_quantile(0.50,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+
+      - record: job:http_request_duration_seconds:p95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+
+      - record: job:http_request_duration_seconds:p99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+
+      # Fraction of requests faster than 300ms — a latency SLI (ratio form).
+      # Requires a bucket boundary at le="0.3"; add one if you do not have it.
+      - record: job:http_latency_good_ratio:rate5m
+        expr: |
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+            / clamp_min(sum by (job) (rate(http_request_duration_seconds_count[5m])), 1e-9)
+
+      # ── Hosts (node_exporter) ───────────────────────────────────────────
+      - record: instance:node_cpu_utilisation:ratio
+        expr: |
+          1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+
+      - record: instance:node_memory_utilisation:ratio
+        expr: |
+          1 - (node_memory_MemAvailable_bytes / clamp_min(node_memory_MemTotal_bytes, 1))
+
+      - record: instance:node_filesystem_avail:ratio
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / clamp_min(node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}, 1)

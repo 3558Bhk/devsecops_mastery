@@ -1,0 +1,7 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project        = "capst"             # SHORT prefix (SQL/vault name length limits)
+location       = "eastus"            # a region near you
+sql_password   = "Capstone-12345!"   # CHANGE THIS
+admin_password = "Capstone-12345!"   # CHANGE THIS

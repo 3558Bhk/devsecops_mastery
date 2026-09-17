@@ -1,0 +1,229 @@
+# =============================================================================
+# Lab 06 — Collector AGENT (DaemonSet): one per node, receives from local pods
+# =============================================================================
+# ★ AGENT vs GATEWAY is the central Collector architecture decision.
+#   See ../../12-collector-in-kubernetes.md
+#
+#   AGENT (this file)    — DaemonSet. Receives from pods ON ITS OWN NODE via the
+#                          Downward API / node IP. Does cheap per-node work:
+#                          k8sattributes enrichment, resourcedetection, basic
+#                          filtering, batching. CANNOT do tail sampling.
+#   GATEWAY (02-...)     — Deployment/StatefulSet. A cluster-wide aggregation
+#                          point. This is where tail sampling, load balancing and
+#                          fan-out live, because they need to see ALL spans of a
+#                          trace in ONE process.
+#
+# ★★ WHY THE AGENT CANNOT TAIL-SAMPLE: a trace's spans are spread across pods on
+#   different nodes, so they reach different agent replicas. Each agent sees a
+#   FRAGMENT. A tail-sampling decision made on a fragment is a decision made on
+#   partial data — which is worse than no decision, because it looks authoritative.
+# =============================================================================
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-agent
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-agent
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector-agent
+  updateStrategy:
+    # ★ DaemonSet default is OnDelete, which means NOTHING UPDATES until you
+    #   manually delete pods. For a telemetry agent that silently pins you to an
+    #   old version. RollingUpdate is what you want.
+    type: RollingUpdate
+    rollingUpdate:
+      # ★ One node at a time, but never take down more than a third of the fleet.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector-agent
+        app.kubernetes.io/component: agent
+      annotations:
+        # ★ Checksum the config so a ConfigMap change actually restarts the pods.
+        #   Without this, `kubectl apply` updates the ConfigMap and the running
+        #   agents keep the OLD config forever. The single most common "I changed
+        #   it and nothing happened" in Kubernetes.
+        checksum/config: "REPLACE_WITH_kubectl_apply_kustomize_or_helm"
+    spec:
+      serviceAccountName: otel-collector
+      priorityClassName: otel-collector-critical
+
+      # ★★ Run as non-root. The contrib image is distroless and already ships a
+      #   non-root user, but stating it makes the requirement explicit and lets
+      #   Pod Security "restricted" admission pass.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ★ Agents must tolerate a node being cordoned/drained differently from
+      #   workloads. tolerations here keep telemetry flowing during maintenance.
+      tolerations:
+        - operator: Exists          # ★ tolerate everything, including NoExecute
+
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.161.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/otelcol-contrib/config.yaml
+
+          env:
+            # ★★ THE DOWNWARD API. This is how the agent knows WHICH NODE it is
+            #   on, which is what makes k8sattributes enrichment possible and
+            #   what lets pods target their local agent by node IP.
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # ★ Gateway address, injected so the agent config can stay static.
+            - name: GATEWAY_ENDPOINT
+              value: "otel-collector-gateway.otel-lab.svc.cluster.local:4317"
+
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              # ★★ hostPort binds the port ON THE NODE. This is what lets a pod
+              #   send to its own node's agent at `$(K8S_NODE_IP):4317` instead
+              #   of crossing the network. It also means only ONE agent per node
+              #   (fine for a DaemonSet) and that the port is unavailable to
+              #   anything else on the host.
+              hostPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              hostPort: 4318
+              protocol: TCP
+            - name: telemetry
+              containerPort: 8888
+              protocol: TCP
+            - name: health
+              containerPort: 13133
+              protocol: TCP
+
+          # ★★ THE DISTROLESS PROBLEM. otel/opentelemetry-collector-contrib has
+          #   NO shell, NO curl, NO wget, NO apk. So:
+          #     exec probes are IMPOSSIBLE      (no binary to exec)
+          #     CMD-based healthchecks are out  (nothing to run)
+          #   You MUST use httpGet against the health_check extension.
+          #   ★ And health_check must bind 0.0.0.0, not localhost — the kubelet
+          #     probes the POD IP, which is not "localhost" from its perspective.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            # ★ 3 failures before restart. A single slow GC pause should not
+            #   restart an agent holding a batch of unexported telemetry.
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # ★ startupProbe covers slow config resolution (many receivers, large
+          #   TA target lists) without loosening liveness for the steady state.
+          startupProbe:
+            httpGet:
+              path: /
+              port: health
+            failureThreshold: 30
+            periodSeconds: 2
+
+          # ★★ RESOURCES. requests == limits for MEMORY makes the pod
+          #   Guaranteed QoS for that resource, which means it is evicted LAST.
+          #   ★ memory_limiter.limit_percentage is relative to the CONTAINER
+          #     limit, so these two numbers must be set TOGETHER. A limit of 512Mi
+          #     with limit_percentage 80 means the limiter fires at ~410Mi.
+          #   ★ CPU is left as a request only (Burstable) so an agent can burst
+          #     during an incident instead of being throttled at exactly the
+          #     wrong moment.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              # ★ Drop ALL. The Collector needs no Linux capabilities. If you
+              #   enable the eBPF-based receivers you WILL need to add some back
+              #   and to reconsider runAsNonRoot — see the README.
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib
+              readOnly: true
+            # ★★ readOnlyRootFilesystem: true means the file_storage extension
+            #   needs a WRITABLE volume or it fails at startup. This is the
+            #   error people hit right after hardening the pod:
+            #     permission denied creating /var/lib/otelcol
+            - name: state
+              mountPath: /var/lib/otelcol
+
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-agent-config
+        # ★ emptyDir, not hostPath. Per-node persistence survives container
+        #   restarts but NOT node replacement — which is correct: an agent's
+        #   queue is local state, and a new node should start clean.
+        # ★ sizeLimit prevents a stuck exporter from filling the node's disk.
+        - name: state
+          emptyDir:
+            sizeLimit: 1Gi
+
+---
+# ★ headless-ish ClusterIP so pods can reach the agent Service, plus the
+#   node-local path via hostPort. Most traffic should use the node IP directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-agent
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-agent
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: otel-collector-agent
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: telemetry
+      port: 8888
+      targetPort: telemetry

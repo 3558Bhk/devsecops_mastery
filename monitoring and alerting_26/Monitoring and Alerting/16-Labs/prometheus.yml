@@ -1,0 +1,106 @@
+# Lab Prometheus config. Reload after editing:
+#   curl -XPOST http://localhost:9090/-/reload
+# Validate first:
+#   promtool check config prometheus.yml
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: lab
+    env: dev
+    replica: prom-0
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+      timeout: 10s
+
+scrape_configs:
+  # ---- Prometheus monitors itself --------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+        labels: {team: sre}
+
+  # ---- Alertmanager -----------------------------------------------------
+  - job_name: alertmanager
+    static_configs:
+      - targets: ['alertmanager:9093']
+        labels: {team: sre}
+
+  # ---- The demo application --------------------------------------------
+  - job_name: demo-app
+    static_configs:
+      - targets: ['demo-app:8000']
+        labels:
+          service: demo-app
+          team: checkout
+    # LAB 2 EXERCISE: uncomment to see relabeling drop a target
+    # relabel_configs:
+    #   - source_labels: [env]
+    #     action: keep
+    #     regex: prod
+
+  # ---- Host metrics ------------------------------------------------------
+  - job_name: node
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels: {team: sre, instance_name: lab-host}
+
+  # ---- Blackbox prober itself -------------------------------------------
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ['blackbox-exporter:9115']
+
+  # ---- HTTP probes THROUGH the blackbox exporter -------------------------
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://nginx:80/            # should succeed
+          - http://demo-app:8000/health # should succeed
+          - http://nginx:80/nope        # 404 → probe_success 0 for http_2xx
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ---- TCP probe ---------------------------------------------------------
+  - job_name: blackbox-tcp
+    metrics_path: /probe
+    params:
+      module: [tcp_connect]
+    static_configs:
+      - targets: ['nginx:80', 'demo-app:8000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ---- Grafana (for its own metrics) -------------------------------------
+  - job_name: grafana
+    static_configs:
+      - targets: ['grafana:3000']
+
+# LAB 6 EXERCISE: ship everything to a long-term store
+# remote_write:
+#   - url: http://mimir:9009/api/v1/push
+#     write_relabel_configs:
+#       - source_labels: [__name__]
+#         regex: 'go_gc_.*|go_memstats_.*'
+#         action: drop

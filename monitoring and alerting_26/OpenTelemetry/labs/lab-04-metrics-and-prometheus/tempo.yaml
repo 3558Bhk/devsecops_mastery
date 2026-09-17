@@ -1,0 +1,73 @@
+# Lab 04 — Tempo single-binary.
+#
+# ★ metrics_generator IS enabled here (unlike Lab 03) because this lab is about
+#   metrics. It remote-writes to Prometheus WITH send_exemplars: true, which is
+#   what makes the metric -> trace hop work on backend-generated series.
+
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 3200
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9095
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  ring:
+    kvstore:
+      store: inmemory
+    instance_addr: 127.0.0.1
+
+ingester:
+  max_block_duration: 5m
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+
+compactor:
+  compaction:
+    compactor_ring:
+      kvstore:
+        store: inmemory
+    block_retention: 24h
+
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      cluster: lab04
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        # ★★ Exemplars are the metric -> trace bridge. Without this the diamonds
+        #   never appear on Tempo-generated series, no matter what Grafana says.
+        send_exemplars: true
+  traces_storage:
+    path: /var/tempo/generator/traces
+  processor:
+    service_graphs:
+      dimensions: [http.route]
+    span_metrics:
+      dimensions: [http.route, http.response.status_code]
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics]

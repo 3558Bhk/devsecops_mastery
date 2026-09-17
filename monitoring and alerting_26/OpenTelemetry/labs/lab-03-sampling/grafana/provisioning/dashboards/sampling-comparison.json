@@ -1,0 +1,337 @@
+{
+  "uid": "lab03-sampling",
+  "title": "Lab 03 — Head vs Tail Sampling",
+  "description": "Same code, same traffic, two sampling strategies. Every PromQL expression here is taken from the tail_sampling README for Collector v0.161.0. Companion reading: 10-sampling.md.",
+  "tags": ["opentelemetry", "lab-03", "sampling"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "1. THE HEADLINE — did tail sampling keep what head sampling lost?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "id": 300
+    },
+    {
+      "type": "timeseries",
+      "title": "★ ERROR traces kept, by sampling path",
+      "description": "Both apps generate identical traffic including 404s and 503s. Tail sampling keeps 100% of ERROR traces via the status_code policy. Head sampling keeps a blind 10%, so roughly 90% of your errors are GONE. This single panel is the entire argument for tail sampling.",
+      "id": 1,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(traces_span_metrics_calls_total{service_name=\"tail-sampled-service\",status_code=~\"(?i).*error.*\"}[2m]))",
+          "legendFormat": "TAIL — errors kept"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(traces_span_metrics_calls_total{service_name=\"head-sampled-service\",status_code=~\"(?i).*error.*\"}[2m]))",
+          "legendFormat": "HEAD — errors kept"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Total spans kept, by sampling path",
+      "description": "The cost side of the trade. Tail sampling keeps MORE overall than a 10% head sample, because errors and slow traces are kept at 100%. That is the point: you spend the budget on traces someone will actually look at.",
+      "id": 2,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(traces_span_metrics_calls_total{service_name=\"tail-sampled-service\"}[2m]))",
+          "legendFormat": "TAIL total"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(traces_span_metrics_calls_total{service_name=\"head-sampled-service\"}[2m]))",
+          "legendFormat": "HEAD total"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "2. Tail sampling internals — the seven metrics you must alert on",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 10 },
+      "collapsed": false,
+      "id": 301
+    },
+    {
+      "type": "stat",
+      "title": "★ Overall sampled fraction",
+      "description": "Upstream's own formula: global_count_traces_sampled{sampled=\"true\"} / global_count_traces_sampled. If this is far from what your policies imply, a policy is not matching what you think it is.",
+      "id": 3,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.05 },
+              { "color": "green", "value": 0.15 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(otelcol_processor_tail_sampling_global_count_traces_sampled{sampled=\"true\"}) / clamp_min(sum(otelcol_processor_tail_sampling_global_count_traces_sampled), 1)",
+          "legendFormat": "sampled fraction"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ Per-policy vote share (which policy is doing the work?)",
+      "description": "Upstream formula: sum(count_traces_sampled{decision=\"sampled\"}) by (policy) / sum(count_traces_sampled) by (policy). ★ CAVEAT from the README: a policy voting to sample does NOT guarantee sampling — an inverted-not-sample or drop decision from another policy would still discard the trace. To see WHICH policy actually decided, enable the processor.tailsamplingprocessor.recordpolicy gate, which adds tailsampling.policy / composite_policy / cached_decision attributes to each sampled span.",
+      "id": 4,
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "stacking": { "mode": "normal" } }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(otelcol_processor_tail_sampling_count_traces_sampled{decision=\"sampled\"}) by (policy) / clamp_min(sum(otelcol_processor_tail_sampling_count_traces_sampled) by (policy), 1)",
+          "legendFormat": "{{policy}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★★ Traces DROPPED TOO EARLY (buffer eviction)",
+      "description": "The circular buffer holds num_traces traces. When a new trace arrives the OLDEST is evicted — possibly before its decision_wait elapsed. Any value above zero means you are losing traces to undersizing, not to policy. Fix: raise num_traces OR lower decision_wait. Both increase memory. THIS IS A MUST-ALERT METRIC.",
+      "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(otelcol_processor_tail_sampling_sampling_trace_dropped_too_early[1m])",
+          "legendFormat": "evicted before decision /s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ Trace removal age vs decision_wait (p1 must be BELOW 10s)",
+      "description": "How long traces actually stayed in the buffer. Upstream: compute p1 and compare to decision_wait. ★ Values CLOSE TO decision_wait mean traces are at risk of eviction if volume rises. This is the leading indicator for the panel on the left — it warns you before dropped_too_early starts climbing.",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.01, sum by (le) (rate(otelcol_processor_tail_sampling_sampling_trace_removal_age_bucket[5m])))",
+          "legendFormat": "p1 removal age"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(otelcol_processor_tail_sampling_sampling_trace_removal_age_bucket[5m])))",
+          "legendFormat": "p50 removal age"
+        },
+        {
+          "refId": "C",
+          "expr": "10",
+          "legendFormat": "decision_wait (10s)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ Decision timer latency (above 1s = decisions land after decision_wait)",
+      "description": "Upstream: 'A latency exceeding 1 second can delay sampling decisions beyond decision_wait, increasing the chance of traces being dropped before sampling. It is therefore recommended to consume this component's output with components that are FAST or trigger asynchronous processing.' If this climbs, your downstream exporter is the bottleneck — not the sampler.",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(otelcol_processor_tail_sampling_sampling_decision_timer_latency_bucket[5m])))",
+          "legendFormat": "p99 decision latency"
+        },
+        {
+          "refId": "B",
+          "expr": "1",
+          "legendFormat": "1s danger threshold"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Late-span age (spans arriving AFTER their trace's decision)",
+      "description": "★ Three scenarios from the README. (1) Decision still in the num_traces buffer -> late spans INHERIT it, harmless. (2) DEFAULT with no decision cache -> the component has never seen the trace, so late spans are buffered for decision_wait and get a FRESH INDEPENDENT DECISION. That is how you get partial traces with no explanation. (3) Decision cache configured -> a 'keep' trace ID is cached and remembered after span data is released. THIS LAB SETS BOTH CACHES TO 500000; they default to 0 (inactive).",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(otelcol_processor_tail_sampling_sampling_late_span_age_bucket[5m])))",
+          "legendFormat": "p95 late-span age"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(otelcol_processor_tail_sampling_sampling_late_span_age_bucket[5m])))",
+          "legendFormat": "p99 late-span age"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "3. Health of the pipeline carrying the sampler",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "collapsed": false,
+      "id": 302
+    },
+    {
+      "type": "timeseries",
+      "title": "Collector memory vs the memory_limiter ceiling (80% of 2Gi)",
+      "description": "tail_sampling memory ≈ num_traces × average trace size + two decision caches. This lab: 50,000 × ~10KB ≈ 500MB buffer, plus 2 × 500,000 cache entries. The limiter fires at ~1.6Gi. ★ Without memory_limiter the container OOMKills instead of shedding — losing every buffered trace plus a cold restart.",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "otelcol_process_memory_rss", "legendFormat": "RSS" },
+        { "refId": "B", "expr": "2 * 1024 * 1024 * 1024 * 0.8", "legendFormat": "memory_limiter ceiling" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Accepted vs sent spans (is the sampler the only thing dropping?)",
+      "description": "The gap between these two lines IS your sampling. If refused or send_failed is also non-zero, you are losing traces to something OTHER than policy — and your sample rate calculation is wrong.",
+      "id": 10,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(otelcol_receiver_accepted_spans[1m]))", "legendFormat": "accepted" },
+        { "refId": "B", "expr": "sum(rate(otelcol_exporter_sent_spans[1m]))", "legendFormat": "sent" },
+        { "refId": "C", "expr": "sum(rate(otelcol_receiver_refused_spans[1m]))", "legendFormat": "refused" },
+        { "refId": "D", "expr": "sum(rate(otelcol_exporter_send_failed_spans[1m]))", "legendFormat": "send_failed" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Policy evaluation errors",
+      "description": "sampling_policy_evaluation_error. A policy that errors on every trace is a policy that is silently doing nothing — often a typo in an attribute key. Non-zero here means your keep-rules are not being evaluated as written.",
+      "id": 11,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "lab03-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(otelcol_processor_tail_sampling_sampling_policy_evaluation_error[1m]))",
+          "legendFormat": "policy evaluation errors/s"
+        }
+      ]
+    }
+  ]
+}

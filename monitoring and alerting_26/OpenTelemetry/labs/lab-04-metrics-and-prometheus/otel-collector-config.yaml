@@ -1,0 +1,322 @@
+# =============================================================================
+# Lab 04 — Metrics into Prometheus: temporality, naming, and the three paths
+# =============================================================================
+# MACHINE-VALIDATED against otelcol-contrib v0.161.0:
+#   otelcol-contrib validate --config=otel-collector-config.yaml
+#
+# Demonstrates every way OTel metrics reach Prometheus, plus the two silent
+# correctness traps: TEMPORALITY and NAME TRANSFORMATION.
+#
+# Companion reading: ../../06-metrics.md, ../../13-backends.md,
+#                    ../../04-semantic-conventions.md
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  file_storage:
+    directory: /var/lib/otelcol
+    create_directory: true
+    timeout: 1s
+
+receivers:
+  # Path A: the application pushes OTLP metrics to us.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Path C: WE scrape a Prometheus endpoint, like Prometheus would.
+  # ★★ In Kubernetes with the Target Allocator this receiver MUST be named
+  #    exactly `prometheus` — `prometheus/foo` fails. Here we use a suffixed
+  #    name deliberately so we can have TWO instances (self-scrape and an
+  #    app-scrape) without hitting that constraint.
+  #    See ../../12-collector-in-kubernetes.md
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-internal
+          scrape_interval: 10s
+          static_configs:
+            - targets: ["localhost:8888"]
+
+  # ---------------------------------------------------------------------------
+  # THE COLLECTOR AS THE SCRAPER. This is the "let the Collector be Prometheus"
+  # pattern: the Collector owns scrape discovery and relabelling, then
+  # remote-writes the result. In Kubernetes the Target Allocator feeds targets
+  # into THIS receiver from your existing ServiceMonitors/PodMonitors, so you
+  # adopt OTel without rewriting a single scrape config.
+  #   See ../../12-collector-in-kubernetes.md
+  #
+  # ★ The target must actually expose Prometheus text format. Here we scrape
+  #   Prometheus itself, which always does. Exercise 5 in the README has you
+  #   point this at the demo app and watch what a failed scrape looks like.
+  # ---------------------------------------------------------------------------
+  prometheus/app:
+    config:
+      scrape_configs:
+        - job_name: scraped-by-collector
+          scrape_interval: 10s
+          static_configs:
+            - targets: ["prometheus:9090"]
+              labels:
+                scrape_owner: collector
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # ---------------------------------------------------------------------------
+  # ★★ THE TEMPORALITY TRAP.
+  #
+  #   Prometheus requires CUMULATIVE. Many SDKs and cloud backends prefer DELTA.
+  #   Feeding delta data to a cumulative-expecting store does not error — it
+  #   produces SILENTLY WRONG VALUES. Counters appear to reset constantly and
+  #   rate() returns nonsense.
+  #
+  #   `delta_to_cumulative` converts. It is STATEFUL: it must see every
+  #   datapoint of a stream in order, so in a multi-replica fleet it requires
+  #   consistent routing (load_balancing with routing_key: streamID or metric).
+  #   Get the routing wrong and you get wrong totals with NO errors — the worst
+  #   failure class there is. See ../../10-sampling.md and ../../14-scale...
+  # ---------------------------------------------------------------------------
+  delta_to_cumulative:
+    # How long to keep state for a stream that stops reporting. Bounded so a
+    # churny stream set does not grow memory forever.
+    max_stale: 5m
+
+  # Add the semconv-correct environment attribute to everything.
+  resource/enrich:
+    attributes:
+      - key: deployment.environment.name
+        value: lab
+        action: upsert
+
+  # ---------------------------------------------------------------------------
+  # ★ CARDINALITY CONTROL, layer 3 of 5 (see ../../14-scale-cost-and-cardinality.md).
+  #   Drop the noise before it ever reaches the TSDB.
+  #
+  #   ★ error_mode defaults to `ignore` in v0.161.0 — the gate
+  #     processor.filter.defaultErrorModeIgnore is TRUE/Stable. That means a
+  #     MALFORMED OTTL condition is swallowed silently and your filter quietly
+  #     does nothing. Use `propagate` while developing.
+  #     ★ Verify gate state with `otelcol-contrib featuregate`, NOT `--help`,
+  #       which reports the opposite value for this gate.
+  # ---------------------------------------------------------------------------
+  filter/metric-noise:
+    error_mode: propagate
+    metrics:
+      metric:
+        # Drop Go runtime internals nobody dashboards on.
+        - 'IsMatch(name, "^go_gc_")'
+        - 'IsMatch(name, "^go_memstats_")'
+      datapoint:
+        # ★ High-cardinality identifiers are PROHIBITED on metrics. If an app
+        #   leaks one into an attribute, drop the datapoint here rather than
+        #   paying for the series forever.
+        - 'attributes["user.id"] != nil'
+        - 'attributes["session.id"] != nil'
+        - 'attributes["order.id"] != nil'
+
+  # Reduce a dimension instead of dropping data: collapse status codes to classes.
+  # ★ This turns 12 distinct values into 5 without losing the signal you query on.
+  transform/reduce-status:
+    error_mode: propagate
+    metric_statements:
+      - context: datapoint
+        statements:
+          - replace_pattern(attributes["http.response.status_code"], "^2\\d\\d", "2xx")
+          - replace_pattern(attributes["http.response.status_code"], "^3\\d\\d", "3xx")
+          - replace_pattern(attributes["http.response.status_code"], "^4\\d\\d", "4xx")
+          - replace_pattern(attributes["http.response.status_code"], "^5\\d\\d", "5xx")
+
+  batch:
+    send_batch_size: 4096
+    timeout: 10s
+
+connectors:
+  # ---------------------------------------------------------------------------
+  # Traces -> RED metrics, with NO application code.
+  #
+  # ★ Default dimensions are service.name, service.instance.id, span.name,
+  #   span.kind and status.code. Listing service.name again FAILS validation:
+  #     connectors::span_metrics: failed validating dimensions:
+  #     duplicate dimension name "service.name"
+  #
+  # ★ `namespace` (default `traces.span.metrics`) becomes the metric name prefix.
+  # ★ `dimensions_cache_size` is DEPRECATED — use aggregation_cardinality_limit.
+  # ★ Durations are in MILLISECONDS: connector.spanmetrics.useSecondAsDefault
+  #   MetricsUnit is FALSE by default. Enable it and every dashboard that
+  #   assumes ms silently reads 1000x low.
+  # ---------------------------------------------------------------------------
+  span_metrics:
+    namespace: traces.span.metrics
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    dimensions:
+      - name: http.route
+      - name: http.request.method
+      - name: http.response.status_code
+    aggregation_cardinality_limit: 1000
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+    # ★ metrics_expiration: if no spans arrive, stop exporting the metric rather
+    #   than holding a stale series forever. 0 = never expire.
+    metrics_expiration: 10m
+
+  # ---------------------------------------------------------------------------
+  # SERVICE GRAPH. Builds the dependency map from spans — edges between services.
+  #
+  # ★ connector.servicegraph.legacyLatencyUnitMs is FALSE (Deprecated), so
+  #   latency is reported in SECONDS here, while span_metrics reports
+  #   MILLISECONDS. Two connectors in the same pipeline, two different units.
+  #   This trips up nearly everyone the first time.
+  # ---------------------------------------------------------------------------
+  service_graph:
+    latency_histogram_buckets: [1ms, 2ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 2.5s, 5s, 10s]
+    dimensions:
+      - http.route
+    store:
+      ttl: 2s
+      max_items: 500
+
+  # Counts everything, cheaply. The sanity check that data is moving at all.
+  count:
+    # ★ These sections are MAPS, not lists. A list fails validation.
+    metrics:
+      metric.count:
+        description: Metrics seen by the Collector
+        unit: "1"
+      metric.datapoint.count:
+        description: Datapoints seen by the Collector
+        unit: "1"
+    spans:
+      trace.span.count:
+        description: Spans seen by the Collector
+        unit: "1"
+
+exporters:
+  # ---------------------------------------------------------------------------
+  # PATH B — PULL. Prometheus scrapes this endpoint.
+  #
+  # ★★ NAME TRANSFORMATION HAPPENS HERE, and it is the #1 "my metric is missing"
+  #   cause. Dots become underscores AND suffixes are appended:
+  #     http.server.request.duration  (unit s, histogram)
+  #       -> http_server_request_duration_seconds_bucket / _sum / _count
+  #     traces.span.metrics.calls     (counter)
+  #       -> traces_span_metrics_calls_total
+  #
+  #   ★ `add_metric_suffixes` is DEPRECATED AND IGNORED. The gate
+  #     exporter.prometheusexporter.DisableAddMetricSuffixes is TRUE, whose real
+  #     effect (verified in source) is that `translation_strategy` always
+  #     governs; unset resolves to UnderscoreEscapingWithSuffixes.
+  #     So setting add_metric_suffixes: false DOES NOTHING. Use
+  #     translation_strategy.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    send_timestamps: true
+    metric_expiration: 10m
+    enable_open_metrics: true
+    # ★ true promotes EVERY resource attribute to a label on EVERY series.
+    #   Convenient, and a cardinality multiplier you did not choose deliberately.
+    #   Leave false and add only what you need via `resource_to_telemetry_conversion`
+    #   or a resource processor allowlist.
+    resource_to_telemetry_conversion:
+      enabled: false
+
+  # ---------------------------------------------------------------------------
+  # PATH B' — PUSH. Remote-write straight into Prometheus.
+  #
+  # ★ Prometheus requires CUMULATIVE, hence delta_to_cumulative upstream.
+  # ★ Verified gate: exporter.prometheusremotewritexporter.RetryOn429 is FALSE
+  #   by default — a rate-limiting backend's 429s are NOT retried. Enable the
+  #   gate if your backend throttles.
+  # ★ exporter.prometheusremotewritexporter.enableSendingRW2 is FALSE — the
+  #   newer Remote-Write 2.0 protocol is opt-in and needs extra config.
+  # ---------------------------------------------------------------------------
+  prometheus_remote_write/prom:
+    endpoint: http://prometheus:9090/api/v1/write
+    resource_to_telemetry_conversion:
+      enabled: false
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+      num_consumers: 10
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+      num_consumers: 10
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  debug:
+    verbosity: basic
+    sampling_initial: 3
+    sampling_thereafter: 500
+
+service:
+  extensions: [health_check, file_storage]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0     # ★ default localhost — invisible to Prometheus
+                port: 8888
+
+  pipelines:
+    # -------------------------------------------------------------------------
+    # TRACES: sampled nothing here (that's Lab 03), but they feed BOTH connectors
+    # so you can compare span_metrics against service_graph.
+    # ★ Both connectors must appear as exporters here AND as receivers below.
+    # -------------------------------------------------------------------------
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/enrich, batch]
+      exporters: [otlp/tempo, span_metrics, service_graph, count, debug]
+
+    # -------------------------------------------------------------------------
+    # METRICS: the app's own metrics (possibly delta), the Collector's scrape
+    # targets, and both connectors' output.
+    #
+    # ★ delta_to_cumulative runs BEFORE the exporters, so everything leaving this
+    #   pipeline is cumulative and Prometheus-safe.
+    # ★ filter/transform run BEFORE delta_to_cumulative so you drop noise before
+    #   paying to keep state for it.
+    # -------------------------------------------------------------------------
+    metrics:
+      receivers: [otlp, prometheus/self, prometheus/app, span_metrics, service_graph, count]
+      processors:
+        - memory_limiter
+        - filter/metric-noise
+        - transform/reduce-status
+        - resource/enrich
+        - delta_to_cumulative
+        - batch
+      exporters: [prometheus, prometheus_remote_write/prom, debug]

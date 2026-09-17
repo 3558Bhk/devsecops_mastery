@@ -1,0 +1,8 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project     = "hello"           # your project name (becomes part of the account name)
+environment = "dev"             # dev | staging | prod
+location    = "eastus"          # pick a region near you
+replication = "LRS"             # LRS | ZRS | RAGRS | RA-GRS
+containers  = ["web", "uploads"]   # add more, e.g. ["web", "uploads", "audit"]

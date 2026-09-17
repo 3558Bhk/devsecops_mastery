@@ -1,0 +1,334 @@
+# =============================================================================
+# Lab 06 — Collector GATEWAY (StatefulSet): the cluster-wide aggregation point
+# =============================================================================
+# ★★ WHY A STATEFULSET AND NOT A DEPLOYMENT.
+#
+#   This gateway runs tail_sampling and load_balancing. BOTH are stateful:
+#     • tail_sampling must see EVERY span of a trace in ONE process
+#     • load_balancing with routing_key: traceID must send a given trace to the
+#       SAME backend replica every time
+#
+#   A Deployment gives you interchangeable pods with random names. When one is
+#   replaced, every trace it was buffering is LOST, and any upstream routing to
+#   it breaks silently. A StatefulSet gives you STABLE NETWORK IDENTITIES
+#   (otel-collector-gateway-0, -1, -2) so upstreams can route to a specific
+#   replica and so a restarted replica rejoins with the same DNS name.
+#
+#   ★ If you are NOT doing tail sampling or trace-ID routing, a Deployment is
+#     simpler and better. Don't pay for stability you don't need.
+#     See ../../12-collector-in-kubernetes.md
+# =============================================================================
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: otel-collector-gateway
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-gateway
+    app.kubernetes.io/component: gateway
+spec:
+  # ★ Stable ordinal identities: -0, -1, -2.
+  serviceName: otel-collector-gateway-headless
+  replicas: 3
+  podManagementPolicy: Parallel    # ★ scale out all at once; OrderedReady is slow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector-gateway
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # ★ ONE AT A TIME. Each replica holds buffered traces; replacing two at
+      #   once drops two buffers' worth of in-flight traces.
+      partition: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector-gateway
+        app.kubernetes.io/component: gateway
+      annotations:
+        checksum/config: "REPLACE_WITH_kubectl_apply_kustomize_or_helm"
+    spec:
+      serviceAccountName: otel-collector
+      priorityClassName: otel-collector-critical
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ★★ ANTI-AFFINITY. Spreading replicas across nodes means a single node
+      #   failure loses at most one replica's buffered traces, not all of them.
+      #   Without this, the scheduler happily stacks all three on one node.
+      affinity:
+        podAntiAffinity:
+          # ★ preferred, not required. `required` makes the StatefulSet UNABLE TO
+          #   SCHEDULE when you have fewer nodes than replicas — which in a dev
+          #   cluster means pods stuck Pending forever with a confusing event.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: otel-collector-gateway
+
+      # ★ Give the process time to drain its queue before SIGKILL. The default
+      #   30s is often too short for a gateway holding 20k queued batches.
+      terminationGracePeriodSeconds: 120
+
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.161.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/otelcol-contrib/config.yaml
+            # ★★ FEATURE GATES must be set here, at the process level. They are
+            #   NOT config-file keys. Verified list comes from
+            #   `otelcol-contrib featuregate` — NOT from `--help`, whose default
+            #   string is STALE and reports the opposite value for some gates.
+            - --feature-gates=processor.tailsamplingprocessor.recordpolicy
+
+          env:
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # ★ Backend endpoints via env so the ConfigMap stays environment-agnostic.
+            - name: TEMPO_ENDPOINT
+              value: "tempo.observability.svc.cluster.local:4317"
+            - name: LOKI_ENDPOINT
+              value: "http://loki.observability.svc.cluster.local:3100/otlp"
+            - name: PROM_REMOTE_WRITE
+              value: "http://prometheus.observability.svc.cluster.local:9090/api/v1/write"
+
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: telemetry
+              containerPort: 8888
+              protocol: TCP
+            - name: prom-export
+              containerPort: 8889
+              protocol: TCP
+            - name: health
+              containerPort: 13133
+              protocol: TCP
+
+          # ★★ NO hostPort on the gateway. Agents reach it by Service DNS; a
+          #   hostPort here would collide across replicas scheduled on one node
+          #   and would pin the gateway to node-local networking for no benefit.
+
+          # ★ Distroleless image => httpGet probes. See the
+          #   agent manifest for the full reasoning.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            # ★ readiness failing removes the pod from the Service endpoints.
+            #   For a tail-sampling gateway that means in-flight traces in THAT
+            #   pod are still processed (it is not killed), but no new ones
+            #   arrive. That is the correct behaviour — better than dropping.
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /
+              port: health
+            failureThreshold: 60     # ★ tail_sampling init can be slow
+            periodSeconds: 2
+
+          # ★★ MEMORY SIZING FOR TAIL SAMPLING.
+          #   Rough model: num_traces × average trace size + decision caches.
+          #   With num_traces: 50000 and ~10KB/trace that is ~500MB of buffer
+          #   ALONE, plus two 500k-entry caches. 512Mi is NOT enough — this is
+          #   the config that OOMKills in production and looks like a mystery.
+          #   ★ requests == limits for memory => Guaranteed QoS => evicted last.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              memory: 2Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib
+              readOnly: true
+            # ★★ PERSISTENT, not emptyDir. The gateway's file_storage backs the
+            #   exporter sending_queue AND the tail_sampling decision state. A
+            #   rolling update should not throw away a queue of unexported
+            #   telemetry — which is exactly what emptyDir does.
+            #   ★ This is the real reason for the StatefulSet: volumeClaimTemplates
+            #     give each ordinal replica its OWN stable volume, reattached
+            #     after rescheduling. A Deployment cannot do this.
+            - name: state
+              mountPath: /var/lib/otelcol
+
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-gateway-config
+
+  # ★★ One PVC per replica, stable across rescheduling.
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # ★ Omit storageClassName to use the cluster default. Pinning a name
+        #   here breaks the manifest on any cluster that lacks that class.
+        resources:
+          requests:
+            # Sized for the sending_queue, not for traces. A 20k-batch queue of
+            # ~50KB batches is ~1GB; 5Gi leaves room for a long backend outage.
+            storage: 5Gi
+
+---
+# ★★ HEADLESS SERVICE (clusterIP: None). This is what gives each StatefulSet pod
+#   its stable per-pod DNS record:
+#     otel-collector-gateway-0.otel-collector-gateway-headless.otel-lab.svc.cluster.local
+#   Required for `serviceName` above, and required if anything routes to a
+#   specific replica. Without clusterIP: None you get ONE virtual IP and no
+#   per-pod names — the whole point of the StatefulSet is lost.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-gateway-headless
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-gateway
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: otel-collector-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+
+---
+# ★ Regular ClusterIP Service for ordinary client traffic (agents -> gateway).
+#   Kubernetes load-balances across replicas; the Collector's own load_balancing
+#   processor does the trace-aware routing on the way OUT.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-gateway
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: otel-collector-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: telemetry
+      port: 8888
+      targetPort: telemetry
+    - name: prom-export
+      port: 8889
+      targetPort: prom-export
+
+---
+# ★★ POD DISRUPTION BUDGET. Without it, `kubectl drain` and cluster upgrades can
+#   evict ALL gateway replicas at once, dropping every buffered trace.
+#   ★ minAvailable: 2 with replicas: 3. Do NOT use maxUnavailable: 0 — that makes
+#     voluntary disruption IMPOSSIBLE and node drains will hang forever.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otel-collector-gateway
+  namespace: otel-lab
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector-gateway
+
+---
+# ★★ HPA on a CUSTOM metric, not CPU.
+#   ★ A Collector's CPU is a poor scaling signal: it is dominated by batching and
+#     compression, and it stays flat while the export QUEUE fills up. The metric
+#     that actually predicts data loss is queue saturation.
+#   ★ Requires the Prometheus Adapter (or equivalent) exposing
+#     otelcol_exporter_queue_size / queue_capacity as an external metric.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otel-collector-gateway
+  namespace: otel-lab
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: otel-collector-gateway
+  minReplicas: 3
+  # ★ maxReplicas interacts with load_balancing: more replicas means more
+  #   backend endpoints to balance across, and a rebalance re-routes traces
+  #   mid-flight. Scale in SLOW steps.
+  maxReplicas: 8
+  metrics:
+    # CPU as a floor, so a genuinely busy gateway still scales.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: otelcol_exporter_queue_size_ratio
+        target:
+          type: AverageValue
+          # ★ Scale when the queue is 60% full — well before it drops anything.
+          averageValue: "600m"
+  behavior:
+    scaleUp:
+      # ★ Fast up: telemetry loss during a spike is unrecoverable.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      # ★ SLOW down: each removed replica discards its buffered state.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300

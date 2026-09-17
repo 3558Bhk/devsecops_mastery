@@ -1,0 +1,7 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+location       = "eastus"        # a region near you
+vm_size        = "Standard_B1s"  # keep it the smallest
+admin_username = "adminuser"     # avoid "admin", "root", "azureuser"
+admin_password = "CHANGE-ME-123" # at least 12 chars — CHANGE THIS

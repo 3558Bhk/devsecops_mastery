@@ -1,0 +1,236 @@
+{
+  "uid": "lab05-logs",
+  "title": "Lab 05 — Logs & the Correlation Triangle",
+  "description": "Two log paths (OTLP and filelog), Loki label promotion vs structured metadata, redaction without telemetry, and log volume as a cost signal. Companion reading: 07-logs.md and 13-backends.md.",
+  "tags": ["opentelemetry", "lab-05", "logs", "loki", "correlation"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "1. Two log paths converging — did both actually arrive?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "id": 500
+    },
+    {
+      "type": "logs",
+      "title": "★ OTLP path — instrumented app (trace_id is a first-class field)",
+      "description": "These LogRecords carry traceId/spanId natively, so Loki's OTLP ingestion maps them straight into structured metadata. In the log details you should see trace_id and span_id WITHOUT any regex parsing. Click the derived field to jump to Tempo.",
+      "id": 1,
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "loki", "uid": "lab05-loki" },
+      "options": { "showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"checkout-service\"}"
+        }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "★ filelog path — uninstrumented legacy service (trace_id was in the BODY)",
+      "description": "This service has NO OTel SDK. trace_id arrived as a JSON field inside the log line. The Collector's transform/correlate-filelog promoted body[\"trace_id\"] into attributes[\"trace_id\"], which lands in the SAME Loki metadata key as the OTLP path. ★ THAT CONVERGENCE IS THE POINT: normalise the legacy path onto the OTel field name and ONE Grafana derived field serves every source.",
+      "id": 2,
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "loki", "uid": "lab05-loki" },
+      "options": { "showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"legacy-uninstrumented\"}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "2. Labels vs structured metadata — the cost decision",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 11 },
+      "collapsed": false,
+      "id": 501
+    },
+    {
+      "type": "table",
+      "title": "★ Active STREAMS (labels) vs queryable METADATA",
+      "description": "Every unique combination of label values is a separate stream, and stream count is your ingest cost. trace_id must NEVER be a label — it is unique per request, so it would create one stream per trace and Loki would fall over. It lives in structured metadata instead, which is queryable without creating streams. Run `count(count by (service_name, log_level) ({service_name=~\".+\"}))` yourself in Explore to see the label cardinality.",
+      "id": 3,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "loki", "uid": "lab05-loki" },
+      "options": { "showHeader": true },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (count_over_time({service_name=~\".+\"} | trace_id != `` [5m]))",
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "★ Structured-metadata query — filter by trace_id WITHOUT a label",
+      "description": "The backtick syntax reads structured metadata directly: {service_name=\"...\"} | trace_id=`abc...`. This works because trace_id is metadata, not a label — so it costs no streams. ★ This is also why tracesToLogsV2 uses filterByTraceID: false plus a customQuery: with OTLP ingestion, enabling filterByTraceID would look for an indexed label that does not exist and return NOTHING, with no error.",
+      "id": 4,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "loki", "uid": "lab05-loki" },
+      "options": { "showTime": true, "showLabels": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=~\".+\"} | severity_text =~ \"ERROR|WARN\""
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "3. Filtering and redaction — what got removed, and what got masked",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 },
+      "collapsed": false,
+      "id": 502
+    },
+    {
+      "type": "logs",
+      "title": "★★ REDACTION — the legacy app logged a password and a card number",
+      "description": "The legacy-app writer emits {\"password\":\"hunter2\",\"card\":\"4111 1111 1111 1111\"} on every line. The redaction processor's blocked_key_patterns catch .*password.* and the blocked_values regex catches the card number. ★ VERIFY IT: if you can still read hunter2 or the digits here, redaction is NOT working — and that is a compliance incident, not a performance one. Check that hash_function is a VALID value: the allowed ones are sha1, sha3, md5, hmac-sha256, hmac-sha512. Bare `sha256` FAILS validation.",
+      "id": 5,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 21 },
+      "datasource": { "type": "loki", "uid": "lab05-loki" },
+      "options": { "showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"legacy-uninstrumented\"}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★★ Redaction audit — derived from an ATTRIBUTE, because redaction emits NO metrics",
+      "description": "VERIFIED: the redaction processor has no generated_telemetry.go and no metrics in its metadata.yaml. There is NO otelcol_processor_redaction_* metric. It writes attributes onto the data (redaction.masked.count / allowed.count / ignored.count at summary: info). To alert on it you must DERIVE a metric from that attribute — here via the span_metrics/redaction_audit connector with redaction.masked.count as a dimension. ★ Never set summary: debug in production: it adds redaction.masked.keys, which LEAKS THE FIELD NAMES you redacted.",
+      "id": 6,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "lab05-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 50, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (redaction_masked_count) (increase(redaction_audit_calls_total[5m]))",
+          "legendFormat": "masked={{redaction_masked_count}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ Log volume — the cheapest early warning that something is logging in a loop",
+      "description": "From the count connector: log.record.count. A logging storm during an incident is exactly when you cannot afford to drop logs, and exactly when Loki ingest cost spikes. Alert on the RATE OF CHANGE, not the absolute level — a 10x jump in one minute is a bug, not traffic.",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "lab05-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(log_record_count[2m]))", "legendFormat": "log records/s (post-filter)" },
+        { "refId": "B", "expr": "sum(rate(otelcol_receiver_accepted_log_records[2m]))", "legendFormat": "accepted at receiver/s (pre-filter)" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ The gap between these two lines IS your filter/log-noise processor",
+      "description": "accepted minus exported = what filter/log-noise dropped. The loadgen hits /healthz three times per cycle and the app logs each one; none of those should reach Loki. If the gap is ZERO, your filter is not matching — and remember error_mode defaults to `ignore` (gate TRUE/Stable), so a MALFORMED condition is swallowed silently and the filter quietly does nothing. This lab sets error_mode: propagate precisely so you get an error instead.",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "lab05-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(otelcol_receiver_accepted_log_records[2m]))", "legendFormat": "accepted" },
+        { "refId": "B", "expr": "sum(rate(otelcol_exporter_sent_log_records[2m]))", "legendFormat": "sent to Loki" },
+        { "refId": "C", "expr": "sum(rate(otelcol_processor_dropped_log_records[2m]))", "legendFormat": "dropped by processors" },
+        { "refId": "D", "expr": "sum(rate(otelcol_exporter_send_failed_log_records[2m]))", "legendFormat": "★ send_failed (Loki rejecting?)" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "4. The correlation triangle — all three hops in one view",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 38 },
+      "collapsed": false,
+      "id": 503
+    },
+    {
+      "type": "timeseries",
+      "title": "★ HOP 1: metric -> trace (exemplar diamonds)",
+      "description": "Enable exemplars and hover the line: each diamond is a real trace ID attached to a metric sample. Clicking it opens Tempo. ★ TWO THINGS MUST BOTH BE TRUE or the diamonds are missing with NO ERROR: (1) Prometheus started with --enable-feature=exemplar-storage, else exemplars are accepted but not retained; (2) the datasource lists BOTH label names — traceID (Tempo's metrics_generator) and trace_id (OTel SDK / remote-write). Listing one means half your exemplars are unclickable.",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "lab05-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "auto" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(traces_span_metrics_calls_total{status_code=~\"(?i).*error.*\"}[2m]))",
+          "legendFormat": "error rate (exemplars attached)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ HOP 2/3: error rate and latency — the spans you will click through to logs",
+      "description": "From any point on these lines, jump to Tempo (tracesToMetrics tags), then from a span jump to its logs (tracesToLogsV2). The V2 custom query is {$__tags} | trace_id=`$__trace.traceId` — tag matchers for service_name plus a structured-metadata filter for the trace. ★ Docs, verbatim: 'The Loki label name you enter must exactly match the label name on your Loki streams. A MISMATCH SILENTLY BREAKS the correlation with no error shown.'",
+      "id": 10,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "lab05-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(traces_span_metrics_calls_total{service_name=\"checkout-service\",status_code=~\"(?i).*error.*\"}[2m]))",
+          "legendFormat": "errors/s"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name=\"checkout-service\"}[5m])))",
+          "legendFormat": "p99 (MILLISECONDS — span_metrics unit is ms, not s)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "★ Log export queue — the signal that Loki is falling behind",
+      "description": "The otlphttp/loki exporter queues on DISK (file_storage) with queue_size 20000, so a Collector restart does not lose the backlog. A rising queue means Loki is rejecting or slow; check per_stream_rate_limit in loki-config.yaml, which returns 429 and surfaces as send_failed_log_records. ★ retry_on_failure.max_elapsed_time is BOUNDED at 300s on purpose: unbounded retry during a Loki outage grows the queue until memory_limiter sheds it — you lose the logs anyway, just later and less predictably.",
+      "id": 11,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "lab05-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "otelcol_exporter_queue_size", "legendFormat": "queue size {{exporter}}" },
+        { "refId": "B", "expr": "otelcol_exporter_queue_capacity", "legendFormat": "queue capacity {{exporter}}" },
+        { "refId": "C", "expr": "sum(rate(otelcol_exporter_enqueue_failed_log_records[2m]))", "legendFormat": "★ enqueue failures/s (queue FULL)" }
+      ]
+    }
+  ]
+}

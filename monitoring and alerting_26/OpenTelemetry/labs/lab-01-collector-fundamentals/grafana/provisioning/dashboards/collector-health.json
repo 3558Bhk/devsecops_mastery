@@ -1,0 +1,275 @@
+{
+  "uid": "lab01-collector-health",
+  "title": "Lab 01 — Collector Health",
+  "description": "Is the pipeline actually working? Every panel here answers one question you should be able to answer in under a minute during an incident. Companion reading: 11-collector.md, 16-troubleshooting.md.",
+  "tags": ["opentelemetry", "lab-01", "collector"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "1. Is data flowing?  (accepted vs exported)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "id": 100
+    },
+    {
+      "type": "timeseries",
+      "title": "Spans accepted by the receiver (per second)",
+      "description": "★ Zero here = the SDK/network problem, NOT a Collector problem. Check port 4317 (gRPC) vs 4318 (HTTP) first.",
+      "id": 1,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(otelcol_receiver_accepted_spans[1m]))",
+          "legendFormat": "accepted spans/s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Spans exported (per second)",
+      "description": "Compare with the panel on the left. accepted >> exported means something is dropping in between.",
+      "id": 2,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(otelcol_exporter_sent_spans[1m]))",
+          "legendFormat": "sent spans/s"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "★ Accept/export ratio",
+      "description": "Should be ~1.0. Below 1.0 means data is being dropped inside the Collector — check refused, queue and sampling.",
+      "id": 3,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1.2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.9 },
+              { "color": "green", "value": 0.99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(otelcol_exporter_sent_spans[5m])) / clamp_min(sum(rate(otelcol_receiver_accepted_spans[5m])), 0.0001)",
+          "legendFormat": "exported / accepted"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "2. Is anything being REFUSED or FAILING?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false,
+      "id": 101
+    },
+    {
+      "type": "timeseries",
+      "title": "Receiver refusals (memory_limiter or downstream backpressure)",
+      "description": "★ Verified: receiverhelper.newReceiverMetrics is OFF in v0.161.0, so these counters do NOT distinguish downstream refusals from internal errors. Correlate with memory_limiter state.",
+      "id": 4,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 60 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(otelcol_receiver_refused_spans[1m]))", "legendFormat": "refused spans/s" },
+        { "refId": "B", "expr": "sum(rate(otelcol_receiver_refused_log_records[1m]))", "legendFormat": "refused logs/s" },
+        { "refId": "C", "expr": "sum(rate(otelcol_receiver_refused_metric_points[1m]))", "legendFormat": "refused points/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Export failures",
+      "description": "★ LAGGING indicator. If you only alert on this, you learn about loss after it happened. Alert on queue fill instead (next panel).",
+      "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 60 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(otelcol_exporter_send_failed_spans[1m]))", "legendFormat": "failed spans/s" },
+        { "refId": "B", "expr": "sum(rate(otelcol_exporter_send_failed_log_records[1m]))", "legendFormat": "failed logs/s" },
+        { "refId": "C", "expr": "sum(rate(otelcol_exporter_send_failed_metric_points[1m]))", "legendFormat": "failed points/s" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "3. The LEADING indicator (alert on this, not on failures)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "collapsed": false,
+      "id": 102
+    },
+    {
+      "type": "timeseries",
+      "title": "★ Export queue fill ratio",
+      "description": "Rises MINUTES before send_failed does. This is the highest-value Collector alert. Note: sending_queue is DISABLED by default in v0.161.0 — enable it or this panel stays empty.",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "red", "value": 0.8 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (exporter) (otelcol_exporter_queue_size) / clamp_min(sum by (exporter) (otelcol_exporter_queue_capacity), 1)",
+          "legendFormat": "{{exporter}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Collector process memory vs the memory_limiter ceiling",
+      "description": "limit_percentage: 80 of a 512Mi container = ~410Mi. Cross that and the limiter starts REFUSING data instead of letting the kernel OOMKill the pod.",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "otelcol_process_memory_rss", "legendFormat": "RSS" },
+        { "refId": "B", "expr": "512 * 1024 * 1024 * 0.8", "legendFormat": "memory_limiter ceiling (80% of 512Mi)" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "4. What the connectors produced",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "collapsed": false,
+      "id": 103
+    },
+    {
+      "type": "timeseries",
+      "title": "span_metrics connector output (calls/s by route)",
+      "description": "Generated from traces — no application code involved. ★ Durations are in MILLISECONDS (useSecondAsDefaultMetricsUnit gate is off).",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 15 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_route) (rate(traces_span_metrics_calls_total[1m]))",
+          "legendFormat": "{{http_route}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "count connector output (records seen per second)",
+      "description": "Cheapest possible proof that data moves. Default metric names: trace.span.count, trace.span.event.count, metric.count, metric.datapoint.count, log.record.count.",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 15 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(trace_span_count_total[1m]))", "legendFormat": "spans/s" },
+        { "refId": "B", "expr": "sum(rate(log_record_count_total[1m]))", "legendFormat": "logs/s" },
+        { "refId": "C", "expr": "sum(rate(metric_count_total[1m]))", "legendFormat": "metrics/s" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "5. Uptime",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
+      "collapsed": false,
+      "id": 104
+    },
+    {
+      "type": "stat",
+      "title": "Collector uptime",
+      "id": 10,
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [{ "refId": "A", "expr": "otelcol_process_uptime", "legendFormat": "uptime" }]
+    },
+    {
+      "type": "stat",
+      "title": "Collector CPU",
+      "id": 11,
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [{ "refId": "A", "expr": "rate(otelcol_process_cpu_seconds[1m])", "legendFormat": "cpu-seconds/s" }]
+    },
+    {
+      "type": "table",
+      "title": "★ Is the scrape working at all? (targets seen by Prometheus)",
+      "description": "If otel-collector is missing here, service.telemetry is still bound to localhost.",
+      "id": 12,
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "lab01-prom" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true },
+      "targets": [{ "refId": "A", "expr": "up", "legendFormat": "", "format": "table", "instant": true }]
+    }
+  ]
+}

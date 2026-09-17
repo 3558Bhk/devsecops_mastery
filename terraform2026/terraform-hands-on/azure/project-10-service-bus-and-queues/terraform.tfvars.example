@@ -1,0 +1,5 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project  = "msg"          # short prefix
+location = "eastus"       # a region near you

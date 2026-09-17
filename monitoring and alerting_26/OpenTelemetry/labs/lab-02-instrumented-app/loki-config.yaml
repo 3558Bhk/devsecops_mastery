@@ -1,0 +1,127 @@
+# Lab 02 — Loki 3.x single-binary config, tuned for OTLP ingestion.
+#
+# ★★ The two settings that make OTLP -> Loki work properly:
+#   1. allow_structured_metadata: true   — lets non-label OTel attributes be
+#      stored as queryable structured metadata instead of being crammed into
+#      labels (which would be a cardinality bomb) or dropped.
+#   2. volume_enabled: true              — Loki's own volume/usage analytics,
+#      useful for the cost exercises in ../../14-scale-cost-and-cardinality.md
+#
+# Requires schema v13 + tsdb index, which is what supports structured metadata.
+
+auth_enabled: false            # single-tenant lab mode
+
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 3100
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9095
+  log_level: info
+
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13              # ★ v13 is required for structured metadata
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # ★★ Structured metadata is where trace_id, span_id, severity_text and every
+  #   non-promoted OTel attribute lands. Without this, OTLP ingestion is lossy.
+  allow_structured_metadata: true
+  volume_enabled: true
+
+  # Guardrails worth knowing about — these are the limits that reject data and
+  # look like "logs are missing". Raised here so the lab never hits them.
+  max_query_lookback: 721h
+  retention_period: 72h
+  ingestion_rate_mb: 32
+  ingestion_burst_size_mb: 64
+  max_global_streams_per_user: 100000
+  # ★ Per-stream rate limit. Too low and Loki returns 429, which the Collector
+  #   surfaces as exporter_send_failed_log_records.
+  per_stream_rate_limit: 10MB
+  per_stream_rate_limit_burst: 20MB
+
+  # ★ Label cardinality limits. Loki is designed for LOW-cardinality labels.
+  #   Exceeding these rejects the whole stream. This is why trace_id must be
+  #   structured metadata, never a label.
+  max_label_name_length: 1024
+  max_label_value_length: 2048
+  max_label_names_per_series: 30
+
+distributor:
+  # ★★ Which OTel RESOURCE attributes Loki promotes to index labels.
+  #   The default set already covers service.name, service.namespace,
+  #   service.instance.id, container.name, deployment.environment and the
+  #   k8s.* family — which is exactly the low-cardinality set you want.
+  #
+  #   Listed explicitly here so the lab is self-documenting: if you change
+  #   this list you change your index cardinality, and that is a cost decision.
+  otlp_config:
+    default_resource_attributes_as_index_labels:
+      - service.name
+      - service.namespace
+      - service.instance.id
+      - deployment.environment
+      - deployment.environment.name
+      - container.name
+      - k8s.cluster.name
+      - k8s.namespace.name
+      - k8s.pod.name
+      - k8s.container.name
+      - k8s.deployment.name
+      - k8s.replicaset.name
+      - k8s.statefulset.name
+      - k8s.daemonset.name
+      - k8s.job.name
+      - k8s.cronjob.name
+      - cloud.region
+      - cloud.availability_zone
+    # ★ Attributes to drop entirely. process.command_line is a classic: it is
+    #   long, unique per pod, and useless in a log index.
+    resource_attributes:
+      drop:
+        - name: process.command_line
+        - name: process.executable.path
+
+ingester:
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+  chunk_idle_period: 5m
+  chunk_retain_period: 30s
+  max_chunk_age: 1h
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true        # ★ required for retention_period to be enforced
+  delete_request_store: filesystem
+  compaction_interval: 10m
+  retention_delete_delay: 2h
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+analytics:
+  reporting_enabled: false

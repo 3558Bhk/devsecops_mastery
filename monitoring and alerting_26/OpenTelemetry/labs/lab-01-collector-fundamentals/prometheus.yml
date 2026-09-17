@@ -1,0 +1,38 @@
+# Lab 01 — Prometheus scrape config
+#
+# ★ THREE ways OTel metrics reach Prometheus; this file uses two of them.
+#   A) scrape the Collector's `prometheus` exporter        -> job: otel-app-metrics
+#   B) scrape the Collector's OWN internal telemetry       -> job: otel-collector
+#   C) remote-write from the Collector (see Lab 04)        -> not used here
+#
+# Companion reading: ../../06-metrics.md, ../../13-backends.md
+
+global:
+  scrape_interval: 5s          # ★ fast on purpose so the lab is responsive
+  evaluation_interval: 15s
+  external_labels:
+    lab: lab-01-collector-fundamentals
+
+scrape_configs:
+  # (A) Application + span_metrics + count-connector data, exposed by the
+  #     Collector's `prometheus` exporter on :8889
+  - job_name: otel-app-metrics
+    static_configs:
+      - targets: ["collector:8889"]
+        labels:
+          source: otel-prometheus-exporter
+
+  # (B) The Collector's own internal telemetry on :8888.
+  #     ★ This is the job that tells you whether the pipeline is healthy.
+  #       It works here because service.telemetry binds 0.0.0.0:8888 —
+  #       the default is localhost, which a sibling container cannot reach.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["collector:8888"]
+        labels:
+          source: otel-internal-telemetry
+
+  # Prometheus scraping itself — handy for sanity-checking PromQL
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

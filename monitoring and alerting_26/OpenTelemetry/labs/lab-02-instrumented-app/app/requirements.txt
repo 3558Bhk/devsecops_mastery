@@ -1,0 +1,28 @@
+# Lab 02 — demo application
+#
+# ★ Versions verified for this folder (Sept 2026):
+#     opentelemetry-api / sdk / exporter   1.44.0     (stable track)
+#     opentelemetry-instrumentation-*      0.65b0     (contrib/experimental track)
+#     opentelemetry-distro                 0.65b0
+#
+# The stable track (1.x) and the contrib track (0.NNb0) are versioned SEPARATELY
+# and must be kept in step. `opentelemetry-distro` pins compatible pairs, which
+# is why we install it rather than cherry-picking instrumentation packages.
+# See ../../09-sdks-and-instrumentation.md
+
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+requests==2.32.*
+
+# --- OpenTelemetry: the distro bundles api + sdk + auto-instrumentation -------
+opentelemetry-distro[otlp]==0.65b0
+opentelemetry-exporter-otlp-proto-grpc==1.44.0
+
+# ★ Explicitly pinned so the lab does not drift when contrib releases.
+#   Bump these together, never independently.
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-requests==0.65b0
+opentelemetry-instrumentation-logging==0.65b0

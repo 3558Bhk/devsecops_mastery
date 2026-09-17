@@ -1,0 +1,39 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "lab-demo-service" } },
+          { "key": "deployment.environment.name", "value": { "stringValue": "lab" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": { "name": "manual.lab", "version": "1.0" },
+          "metrics": [
+            {
+              "name": "lab.requests",
+              "description": "Requests handled by the lab demo service",
+              "unit": "1",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      { "key": "http.route", "value": { "stringValue": "/demo" } },
+                      { "key": "http.response.status_code", "value": { "stringValue": "$CODE" } }
+                    ],
+                    "startTimeUnixNano": "$START",
+                    "timeUnixNano": "$TS",
+                    "asInt": "$I"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

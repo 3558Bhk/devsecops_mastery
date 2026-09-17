@@ -1,0 +1,110 @@
+# Unit tests for the application-red alert rules.
+# Run with:  promtool test rules tests/example_test.yaml
+#
+# This is the file you copy for every new alert rule. It is the only reliable
+# way to know an alert fires WHEN you want, WITH the labels and annotations
+# you expect — before it pages you at 3am.
+#
+# Input-series value syntax:
+#   0+100x60   start at 0, add 100 each step, for 60 steps
+#   1000x10    constant 1000 for 10 steps
+#   0 5 10 20  explicit values
+#   _          gap (no sample at this step)
+#   stale      inject a staleness marker (series disappears)
+
+rule_files:
+  - ../rules/application-red.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ────────────────────────────────────────────────────────────────────────
+  # Case 1: sustained high error ratio WITH real traffic → alert must fire
+  # ────────────────────────────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      # 1000 ok requests/min from t=0
+      - series: 'http_requests_total{service="checkout-api",namespace="prod",status="200"}'
+        values: '0+1000x40'
+      # errors start at t=12m: +250/min → error ratio = 250/1250 = 20% (> 5%)
+      - series: 'http_requests_total{service="checkout-api",namespace="prod",status="500"}'
+        values: '_x12 0+250x28'
+
+    # --- expression-level assertions (recording rules / SLIs) ---
+    # GOTCHA: promtool compares sample values EXACTLY. rate() does linear
+    # extrapolation, so 250/1250 comes back as 0.19999999999999998, not 0.2.
+    # When a test "fails" with a value that looks right to 15 decimal places,
+    # this is why — copy the actual value from the failure output.
+    promql_expr_test:
+      - expr: |
+          sum by (service, namespace) (rate(http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum by (service, namespace) (rate(http_requests_total{status!~"4.."}[5m])), 1e-9)
+        eval_time: 20m
+        exp_samples:
+          - labels: '{service="checkout-api",namespace="prod"}'
+            value: 0.19999999999999998
+
+    # --- alert-state assertions ---
+    alert_rule_test:
+      # At 18m the expression has been true for >5m but the rule needs `for: 10m`
+      # after the rate() window fills, so it is still PENDING.
+      - eval_time: 18m
+        alertname: ServiceHighErrorRatio
+        exp_alerts: []
+
+      # By 30m the condition has held long enough → FIRING with full metadata.
+      - eval_time: 30m
+        alertname: ServiceHighErrorRatio
+        exp_alerts:
+          - exp_labels:
+              service: checkout-api
+              namespace: prod
+              severity: page
+              team: app
+            exp_annotations:
+              summary: "checkout-api error ratio 20% (>5%) for 10m"
+              description: "Users of checkout-api in prod are receiving 5xx responses."
+              runbook: "https://runbooks.example.com/app/high-error-ratio"
+              dashboard: "https://grafana.example.com/d/service-red?var-service=checkout-api&var-namespace=prod"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Case 2: the SAME error ratio but almost no traffic → must NOT page.
+  # This is the test that proves your traffic guard works.
+  # ────────────────────────────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{service="idle-batch",namespace="prod",status="200"}'
+        values: '0+2x40'          # ~0.033 req/s
+      - series: 'http_requests_total{service="idle-batch",namespace="prod",status="500"}'
+        values: '0+2x40'          # 50% error ratio, but on ~0.07 req/s total
+
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ServiceHighErrorRatio
+        exp_alerts: []             # guard `> 1 req/s` suppresses it — correct
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Case 3: every instance of a job stops reporting → ServiceAllInstancesDown
+  # ────────────────────────────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'up{job="checkout-api",instance="10.0.0.1:8080"}'
+        values: '1x10 0x30'
+      - series: 'up{job="checkout-api",instance="10.0.0.2:8080"}'
+        values: '1x10 0x30'
+
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ServiceAllInstancesDown
+        exp_alerts: []             # still up
+      - eval_time: 20m
+        alertname: ServiceAllInstancesDown
+        exp_alerts:
+          - exp_labels:
+              job: checkout-api
+              severity: page
+              team: app
+            exp_annotations:
+              summary: "Every instance of checkout-api is down"
+              description: "Total outage for this job — no traffic is being served or scraped."
+              runbook: "https://runbooks.example.com/app/service-down"

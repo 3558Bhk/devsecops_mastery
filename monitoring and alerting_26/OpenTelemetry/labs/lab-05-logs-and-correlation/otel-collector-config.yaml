@@ -1,0 +1,417 @@
+# =============================================================================
+# Lab 05 — Logs into Loki, and the correlation triangle
+# =============================================================================
+# MACHINE-VALIDATED against otelcol-contrib v0.161.0:
+#   otelcol-contrib validate --config=otel-collector-config.yaml
+#
+# ★★ THE HEADLINE: there is NO `loki` EXPORTER in contrib v0.161.0. It was
+#    removed. `loki` exists only as a RECEIVER. Writing `exporters: [loki]`
+#    fails with:
+#      'exporters' unknown type: "loki" for id: "loki" (valid values: [...])
+#    The supported path is `otlphttp` against Loki's NATIVE OTLP endpoint.
+#
+# TWO LOG PATHS, deliberately:
+#   1. OTLP     — the instrumented app's SDK logs (trace context already there)
+#   2. filelog  — a legacy/uninstrumented service writing JSON to a file, where
+#                 trace_id must be PARSED OUT of the body to correlate at all
+#
+# Companion reading: ../../07-logs.md, ../../13-backends.md,
+#                    ../../05-otel-data-model.md
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  file_storage:
+    directory: /var/lib/otelcol
+    create_directory: true
+    timeout: 1s
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # ---------------------------------------------------------------------------
+  # PATH 2 — TAILING A FILE. This is how you get logs from something you cannot
+  # instrument: a third-party binary, a legacy service, a container that only
+  # writes to stdout captured into a shared volume.
+  #
+  # ★★ COMPONENT NAME: the canonical name in v0.161.0 is `file_log`, NOT
+  #   `filelog`. Collector components were renamed to lower_snake_case and the
+  #   old names still parse as DEPRECATED ALIASES — which is exactly why this is
+  #   confusing: `filelog/legacy` validates clean and works, but `components`
+  #   lists only `file_log`. Use the canonical name in new configs.
+  #   Same for host_metrics, k8s_objects, k8s_attributes, resource_detection,
+  #   metrics_transform, cumulative_to_delta, kubelet_stats, load_balancing.
+  #
+  # ★ filelog keeps a persisted OFFSET so a restart resumes instead of
+  #   re-reading (or skipping) the file. Without storage you get duplicates on
+  #   every restart.
+  #
+  # ★ Gates that are ON by default in v0.161.0 and change behaviour:
+  #     filelog.allowFileDeletion        = TRUE
+  #     filelog.allowHeaderMetadataParsing = TRUE
+  #     filelog.mtimeSortType            = TRUE  (sort by mtime, not name)
+  #   ★★ allowFileDeletion=TRUE means a rotated-away file can be dropped before
+  #      it is fully read. If your rotation is faster than your read rate you
+  #      LOSE LOGS SILENTLY.
+  # ---------------------------------------------------------------------------
+  file_log/legacy:
+    include:
+      - /var/log/legacy/*.log
+    start_at: end
+    # ★ Persist the read offset across restarts.
+    storage: file_storage
+    # Keep the source path/name as resource attributes so you can tell two
+    # services apart in Loki.
+    include_file_path: true
+    include_file_name: true
+    max_log_size: 1MiB
+    poll_interval: 200ms
+    operators:
+      # The legacy service writes one JSON object per line. Parse it so fields
+      # become attributes instead of an opaque body string.
+      - type: json_parser
+        parse_from: body
+        # ★ If a line ISN'T valid JSON, drop the parse error rather than
+        #   dropping the LOG. Losing the record is worse than losing the parse.
+        on_error: send
+      # Timestamp: without this Loki uses ingest time, which is wrong on
+      # backfill and makes log ordering lie during an incident.
+      - type: time_parser
+        parse_from: attributes.time
+        layout: "%Y-%m-%dT%H:%M:%S.%fZ"
+        on_error: send
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  resource/enrich:
+    attributes:
+      - key: deployment.environment.name
+        value: lab
+        action: upsert
+
+  # ---------------------------------------------------------------------------
+  # ★★ CORRELATION MECHANISM 1 (filelog path): pull trace_id OUT of the parsed
+  #    body and into an ATTRIBUTE.
+  #
+  #    Why this matters: Loki's native OTLP ingestion maps a LogRecord's
+  #    first-class trace_id/span_id fields into structured metadata
+  #    (`trace_id`, `span_id`) — but the filelog receiver has NO such fields,
+  #    because the source isn't OTel-instrumented. The value lives in the body.
+  #    Moving it to `attributes["trace_id"]` makes it land in the SAME metadata
+  #    key, so ONE Grafana derived field works for both log paths.
+  # ---------------------------------------------------------------------------
+  transform/correlate-file_log:
+    error_mode: propagate
+    log_statements:
+      - context: log
+        statements:
+          # The JSON body carried a trace_id field. Promote it.
+          - set(attributes["trace_id"], body["trace_id"]) where IsString(body["trace_id"])
+          - set(attributes["span_id"], body["span_id"]) where IsString(body["span_id"])
+          # Severity: filelog gives you no severity, so derive it. Loki filters on
+          # metadata["severity_text"], so this is what makes level-filtering work.
+          - set(severity_text, "ERROR") where IsString(body["level"]) and body["level"] == "error"
+          - set(severity_text, "WARN")  where IsString(body["level"]) and body["level"] == "warn"
+          - set(severity_text, "INFO")  where IsString(body["level"]) and body["level"] == "info"
+          - set(severity_number, 17) where severity_text == "ERROR"
+          - set(severity_number, 13) where severity_text == "WARN"
+          - set(severity_number, 9)  where severity_text == "INFO"
+          # The body is now redundant with the attributes — flatten it so Loki's
+          # __line__ is the human-readable message, not a JSON blob.
+          - set(body, body["message"]) where IsString(body["message"])
+
+  # ---------------------------------------------------------------------------
+  # ★★ LABEL PROMOTION. Loki indexes LABELS and stores everything else as
+  #    structured metadata. Only promote what you filter on constantly — every
+  #    promoted label multiplies stream count, and stream count is your cost.
+  #
+  #    Loki's DEFAULT promoted resource attributes are:
+  #      cloud.region, cloud.availability_zone, container.name,
+  #      deployment.environment, k8s.* family, service.name, service.namespace,
+  #      service.instance.id
+  #    ★ Note `deployment.environment` — NOT `deployment.environment.name`, which
+  #      is the current semconv spelling. The default list has not caught up, so
+  #      set it explicitly in loki-config.yaml (see the note there).
+  # ---------------------------------------------------------------------------
+  # ★★ VERIFIED ERROR — `upsert` REQUIRES a value source. This fails:
+  #     - key: service.name
+  #       action: upsert
+  #   → failed to build pipelines: failed to create "attributes/loki-labels"
+  #     processor, in pipeline "logs": error with key "service.name"
+  #     (0-th action): error creating AttrProc. Either field "value",
+  #     "from_attribute", "from_context", or "default_value" must be specified
+  #
+  #   ★ Note the error PREFIX: `failed to build pipelines:` — that class means
+  #     the config PARSED and the schema was fine, but an incompatible
+  #     combination was caught at build time. Different from `cannot unmarshal`
+  #     (schema) and `service::pipelines::X: references` (wiring).
+  #
+  #   So: to rename/normalise you must actually say what the new value is.
+  #   `service.name` and `deployment.environment.name` already arrive correctly
+  #   from the SDK and from resource/enrich, so the only transformation we need
+  #   here is deriving `log.level` from severity.
+  attributes/loki-labels:
+    actions:
+      # ★ A per-service log level as a LABEL lets you cut stream count by not
+      #   shipping DEBUG for the boring services. But it also means a level
+      #   change creates a NEW STREAM. Use deliberately.
+      - key: log.level
+        from_attribute: severity_text
+        action: upsert
+      # ★ Legacy/filelog records have no service.name at all — they'd land in
+      #   Loki with an empty label. Give them a default so every stream has one.
+      - key: service.name
+        action: upsert
+        # ★ from_attribute copies if present; default_value only applies when the
+        #   source is missing. Together: keep the SDK's value, fill in the gap.
+        from_attribute: service.name
+        default_value: legacy-uninstrumented
+
+  # ---------------------------------------------------------------------------
+  # ★ PII IN LOGS. Logs leak far more than traces do, because bodies are free
+  #   text written by whoever was debugging at 2am.
+  #
+  #   ★★ redaction emits NO internal metrics (verified: no generated_telemetry.go,
+  #      no metrics in metadata.yaml). It writes ATTRIBUTES onto the data:
+  #        redaction.masked.count / allowed.count / ignored.count   (summary: info)
+  #        redaction.masked.keys                                    (summary: debug)
+  #      ★ summary: debug LEAKS THE FIELD NAMES you redacted. Never in prod.
+  #      To ALERT on redaction you must derive a metric from the attribute — see
+  #      the redaction_audit connector below and Lab 02.
+  # ---------------------------------------------------------------------------
+  redaction/logs:
+    allow_all_keys: false
+    # ★ Fail closed: anything not listed is masked. An allowlist you forget to
+    #   update hides a field; a denylist you forget to update LEAKS one.
+    allowed_keys:
+      - service.name
+      - deployment.environment.name
+      - log.level
+      - trace_id
+      - span_id
+      - http.route
+      - http.request.method
+      - http.response.status_code
+    ignored_keys:
+      - log.file.path
+      - log.file.name
+    # Mask the value, and catch the classic patterns in bodies.
+    redact_all_types: true
+    blocked_key_patterns:
+      - ".*password.*"
+      - ".*secret.*"
+      - ".*token.*"
+      - ".*authorization.*"
+      - ".*credit.?card.*"
+      - ".*ssn.*"
+    blocked_values:
+      # Card-like and email-like patterns in free text.
+      - "\\b(?:\\d[ -]*?){13,16}\\b"
+      - "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+    summary: info
+
+    # ★★ VERIFIED — the allowed values are NOT the hash names you'd guess:
+    #      sha1, sha3, md5, hmac-sha256, hmac-sha512
+    #   `sha256` is INVALID and fails validation verbatim:
+    #     'hash_function' unknown HashFunction sha256, allowed functions are
+    #     sha1, sha3, md5, hmac-sha256 and hmac-sha512
+    #   ★ Note the asymmetry: bare SHA-256 is absent, but the HMAC variants are
+    #     named with a dash. And `md5`/`sha1` are offered despite being
+    #     cryptographically broken — fine for redaction fingerprinting, NOT for
+    #     anything security-relevant.
+    #   ★ The hmac-* variants additionally require `hmac_key` to be set.
+    hash_function: sha3
+
+  # ---------------------------------------------------------------------------
+  # ★ DROP NOISE BEFORE IT COSTS YOU. Loki charges by ingested volume; a
+  #   healthcheck line every 2s is pure cost with zero diagnostic value.
+  #   `error_mode` defaults to `ignore` (gate TRUE/Stable) — a malformed
+  #   condition is swallowed and your filter quietly does nothing. Use propagate.
+  # ---------------------------------------------------------------------------
+  filter/log-noise:
+    error_mode: propagate
+    logs:
+      log_record:
+        # Healthcheck probes — high volume, no information.
+        - 'IsMatch(body, "GET /healthz")'
+        - 'IsMatch(attributes["http.route"], "^/healthz$")'
+        - 'IsMatch(attributes["url.path"], "^/healthz$")'
+        # Framework chatter.
+        - 'IsMatch(body, "^(?:Started|Finished) server process")'
+        - 'IsMatch(body, "Waiting for application startup")'
+
+  batch:
+    # ★ LOGS BATCH DIFFERENTLY FROM TRACES. Log volume is bursty (a stack trace
+    #   is 40 lines at once), so a smaller batch with a shorter timeout keeps
+    #   latency down without starving the exporter.
+    send_batch_size: 2048
+    send_batch_max_size: 4096
+    timeout: 2s
+
+connectors:
+  # ★ Counts log records so you can alert on VOLUME — the cheapest early warning
+  #   that something started logging in a loop.
+  count:
+    # ★ These sections are MAPS, not lists. A list fails validation.
+    logs:
+      log.record.count:
+        description: Log records seen by the Collector
+        unit: "1"
+    metrics:
+      metric.count:
+        description: Metrics seen by the Collector
+        unit: "1"
+
+  # RED metrics for the traces in this lab, so the metric->trace->log triangle
+  # is complete in one place.
+  span_metrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    # ★ service.name and service.instance.id are DEFAULT dimensions — listing
+    #   them fails validation with "duplicate dimension name".
+    dimensions:
+      - name: http.route
+      - name: http.response.status_code
+    aggregation_cardinality_limit: 1000
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+
+  # ★★ Derive a metric from the redaction ATTRIBUTE, because redaction itself
+  #    emits no telemetry. This is the only way to alert on "redaction stopped
+  #    working" — which is a compliance incident, not a performance one.
+  span_metrics/redaction_audit:
+    namespace: redaction.audit
+    dimensions:
+      - name: redaction.masked.count
+      - name: redaction.ignored.count
+    aggregation_cardinality_limit: 100
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+
+exporters:
+  # ---------------------------------------------------------------------------
+  # ★★ THE ONLY SUPPORTED WAY TO GET LOGS INTO LOKI FROM THE COLLECTOR.
+  #
+  #   endpoint is the BASE. The otlphttp exporter APPENDS the signal path, so
+  #   `http://loki:3100/otlp` becomes `http://loki:3100/otlp/v1/logs`.
+  #   ★ Do NOT write the full `/otlp/v1/logs` here — you'd get
+  #     `/otlp/v1/logs/v1/logs` and a 404 that looks like a Loki bug.
+  #
+  #   Requires Loki >= 3.0 with schema v13/tsdb and allow_structured_metadata.
+  #   The old `lokiexporter` is DEPRECATED and GONE from contrib.
+  # ---------------------------------------------------------------------------
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    encoding: proto
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      # ★★ LOGS ARE THE SIGNAL MOST LIKELY TO BACK UP. A logging storm during an
+      #   incident is exactly when you cannot afford to drop. Queue on disk so a
+      #   Collector restart does not lose the backlog.
+      queue_size: 20000
+      num_consumers: 10
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      # ★ Bounded. Unbounded retry during a Loki outage means an ever-growing
+      #   queue and eventually memory_limiter shedding — i.e. you lose the logs
+      #   anyway, just later and less predictably.
+      max_elapsed_time: 300s
+    timeout: 30s
+
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+      num_consumers: 10
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    send_timestamps: true
+    metric_expiration: 10m
+    enable_open_metrics: true
+    # ★ false on purpose: promoting EVERY resource attribute to a label on EVERY
+    #   series is a cardinality multiplier you did not choose deliberately.
+    resource_to_telemetry_conversion:
+      enabled: false
+
+  debug:
+    verbosity: basic
+    sampling_initial: 3
+    sampling_thereafter: 500
+
+service:
+  extensions: [health_check, file_storage]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0     # ★ default is localhost — invisible to Prometheus
+                port: 8888
+
+  pipelines:
+    # -------------------------------------------------------------------------
+    # LOGS — both paths converge here.
+    #
+    # ★ ORDERING MATTERS and `validate` WILL NOT CHECK IT:
+    #   1. memory_limiter FIRST (protect the process)
+    #   2. transform/correlate-filelog — extract trace_id while the body is
+    #      still parsed JSON; after redaction the fields may be masked
+    #   3. attributes — set the labels redaction is allowed to keep
+    #   4. redaction — mask PII. ★ AFTER correlation, or you may mask the very
+    #      trace_id you need to join on
+    #   5. filter — drop noise. ★ AFTER redaction so a masked value can't be
+    #      matched by a body filter that assumed plaintext
+    #   6. batch LAST
+    # -------------------------------------------------------------------------
+    logs:
+      receivers: [otlp, file_log/legacy]
+      processors:
+        - memory_limiter
+        - resource/enrich
+        - transform/correlate-file_log
+        - attributes/loki-labels
+        - redaction/logs
+        - filter/log-noise
+        - batch
+      exporters: [otlphttp/loki, count, debug]
+
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/enrich, batch]
+      exporters: [otlp/tempo, span_metrics, span_metrics/redaction_audit, debug]
+
+    metrics:
+      receivers: [otlp, span_metrics, span_metrics/redaction_audit, count]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus, debug]

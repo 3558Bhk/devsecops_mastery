@@ -1,0 +1,32 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "lab-demo-service" } },
+          { "key": "deployment.environment.name", "value": { "stringValue": "lab" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "manual.lab", "version": "1.0" },
+          "logRecords": [
+            {
+              "timeUnixNano": "$TS",
+              "observedTimeUnixNano": "$TS",
+              "severityNumber": "$SEV",
+              "severityText": "$SEVTXT",
+              "traceId": "$TRACEID",
+              "spanId": "$SPANID",
+              "body": { "stringValue": "lab request $I completed with status $CODE" },
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/demo" } },
+                { "key": "log.file.name", "value": { "stringValue": "demo-service.log" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

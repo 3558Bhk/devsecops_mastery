@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+environment   = "dev"           # dev | staging | prod
+instance_type = "t4g.micro"     # keep the smallest! free tier friendly
+allowed_cidr  = "0.0.0.0/0"     # CHANGE ME: run `curl ifconfig.co` and put "your.ip/32"

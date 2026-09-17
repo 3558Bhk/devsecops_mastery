@@ -1,0 +1,5 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project  = "func"          # short prefix (storage names are length-limited)
+location = "eastus"        # a region near you

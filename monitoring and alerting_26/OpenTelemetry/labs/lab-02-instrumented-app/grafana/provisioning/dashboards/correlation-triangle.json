@@ -1,0 +1,494 @@
+{
+  "uid": "lab02-correlation",
+  "title": "Lab 02 \u2014 The Correlation Triangle",
+  "description": "Metric -> trace -> log -> back to metric. Every panel here exists to demonstrate one hop of the triangle, which is the whole point of running three specialised backends instead of one. Companion reading: 13-backends.md, 07-logs.md, 05-traces.md.",
+  "tags": [
+    "opentelemetry",
+    "lab-02",
+    "correlation"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "1. HOP ONE \u2014 metric to trace (click a diamond on the graph)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "id": 200
+    },
+    {
+      "type": "timeseries",
+      "title": "\u2605 Request rate WITH EXEMPLARS (click a diamond to open its trace)",
+      "description": "Exemplars are the diamonds. Clicking one opens the exact trace that produced that sample. Requires --enable-feature=exemplar-storage on Prometheus AND exemplarTraceIdDestinations on the datasource. If no diamonds appear, that link is broken \u2014 check both.",
+      "id": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (rate(traces_span_metrics_calls_total[1m]))",
+          "legendFormat": "{{service_name}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Error rate (click a diamond to jump straight to a failing trace)",
+      "description": "\u2605 The status_code label value depends on a feature gate. spanmetrics.statusCodeConvention.useOtelPrefix is FALSE by default in v0.161.0, so the value is the STATUS_CODE_ERROR / Error convention rather than otel.status_code=ERROR. The regex below matches either. Run `count by (status_code) (traces_span_metrics_calls_total)` in Explore to see your actual values.",
+      "id": 2,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (rate(traces_span_metrics_calls_total{status_code=~\"(?i).*error.*\"}[1m]))",
+          "legendFormat": "{{service_name}} errors"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "2. Latency \u2014 and why the UNIT matters",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
+      "collapsed": false,
+      "id": 201
+    },
+    {
+      "type": "timeseries",
+      "title": "p50 / p95 / p99 latency by service",
+      "description": "\u2605 UNIT WARNING: connector.spanmetrics.useSecondAsDefaultMetricsUnit is FALSE by default, so the span_metrics connector records durations in MILLISECONDS. The panel unit is set to ms to match. If you flip that gate, or migrate a dashboard from a semconv V1 source (which uses seconds), your p99 shows 0.5 instead of 500. Always check the metric's unit field, not just its name.",
+      "id": 3,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 11
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))",
+          "legendFormat": "p99 {{service_name}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))",
+          "legendFormat": "p95 {{service_name}}"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.50, sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))",
+          "legendFormat": "p50 {{service_name}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency by route \u2014 \u2605 is /healthz dominating your data?",
+      "description": "The load generator hits /healthz 3x per loop and everything else once. Watch how much of your total telemetry budget goes to an endpoint nobody investigates. This is the visual argument for filtering health checks at the Collector edge \u2014 see 14-scale-cost-and-cardinality.md.",
+      "id": 4,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 11
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (http_route) (rate(traces_span_metrics_calls_total[1m]))",
+          "legendFormat": "{{http_route}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "3. HOP TWO \u2014 trace to logs (open a trace in Explore, click a span, click Logs)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "collapsed": false,
+      "id": 202
+    },
+    {
+      "type": "logs",
+      "title": "\u2605 Logs for checkout-service (click 'View trace' on any line)",
+      "description": "Two things to verify here. (1) Each line shows [trace_id=... span_id=...] because app/main.py's formatter prints the fields that opentelemetry-instrumentation-logging injects \u2014 the SDK adds them, YOUR FORMATTER decides whether they appear. (2) A 'View trace' link appears on each line, from the Loki datasource's derivedFields. That is the log -> trace hop.",
+      "id": 5,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "lab02-loki"
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"checkout-service\"}",
+          "queryType": "range",
+          "maxLines": 200
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "4. HOP THREE \u2014 trace back to metrics",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "collapsed": false,
+      "id": 203
+    },
+    {
+      "type": "timeseries",
+      "title": "Spans by kind and status (what the span_metrics connector produced)",
+      "description": "The connector's DEFAULT dimensions are service.name, span.name, span.kind and status.code. \u2605 service.name is already a default \u2014 adding it to your dimensions list fails validation with 'duplicate dimension name'. This is why you can group by span_kind and status_code without configuring them.",
+      "id": 6,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (span_kind, status_code) (rate(traces_span_metrics_calls_total[1m]))",
+          "legendFormat": "{{span_kind}} / {{status_code}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "\u2605 Span-name cardinality \u2014 the silent cost driver",
+      "description": "Count of distinct span.name values over time. /products/{product_id} is a bounded ROUTE TEMPLATE (good). If you see this number climb without bound, something is naming spans after a raw identifier \u2014 see the deliberate mistake in app/main.py get_product(). This is the metric that catches a cardinality explosion before the bill does.",
+      "id": 7,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (span_name) (traces_span_metrics_calls_total))",
+          "legendFormat": "distinct span_name values"
+        },
+        {
+          "refId": "B",
+          "expr": "count(count by (service_name, span_name, span_kind, status_code, http_route, http_request_method, http_response_status_code) (traces_span_metrics_calls_total))",
+          "legendFormat": "total distinct series"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "5. Is the pipeline healthy? (Collector self-telemetry)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "collapsed": false,
+      "id": 204
+    },
+    {
+      "type": "timeseries",
+      "title": "Accepted vs sent vs refused (spans)",
+      "description": "accepted >> sent means something drops in between. refused > 0 means memory_limiter fired or downstream backpressure propagated. See 16-troubleshooting.md \u00a716.6 for all seven loss points.",
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 42
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(otelcol_receiver_accepted_spans[1m]))",
+          "legendFormat": "accepted"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(otelcol_exporter_sent_spans[1m]))",
+          "legendFormat": "sent"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(otelcol_receiver_refused_spans[1m]))",
+          "legendFormat": "refused"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(otelcol_exporter_send_failed_spans[1m]))",
+          "legendFormat": "send_failed"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "\u2605 Export queue fill ratio (the LEADING indicator)",
+      "description": "Rises minutes before send_failed does. This lab enables sending_queue with a persistent file_storage backend, so this panel has data \u2014 unlike Lab 01 where the queue is off by default. Alert on >0.8, not on send failures.",
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 42
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (exporter) (otelcol_exporter_queue_size) / clamp_min(sum by (exporter) (otelcol_exporter_queue_capacity), 1)",
+          "legendFormat": "{{exporter}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "\u2605 Did redaction actually do anything? (derived metric)",
+      "description": "The app deliberately sets customer.email, customer.card and customer.note. \u2605 VERIFIED: the redaction processor emits NO internal metrics in v0.161.0 \u2014 it writes ATTRIBUTES onto the data (redaction.masked.count, redaction.allowed.count) when summary is info or debug. So this panel queries a metric DERIVED from those attributes by the span_metrics/redaction_audit connector, which uses redaction.masked.count as a dimension. If the >0 series is flat at zero, your blocked_values regexes are not matching \u2014 and without this panel you would never know. \u2605 Never use summary: debug in production: it also emits redaction.masked.keys, which tells an attacker exactly which fields you consider sensitive.",
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 42
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "lab02-prom"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 50
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (redaction_masked_count) (rate(redaction_audit_calls_total[5m]))",
+          "legendFormat": "masked={{redaction_masked_count}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(redaction_audit_calls_total{redaction_masked_count!=\"\",redaction_masked_count!=\"0\"}[5m]))",
+          "legendFormat": "spans with >=1 masked value"
+        }
+      ]
+    }
+  ]
+}

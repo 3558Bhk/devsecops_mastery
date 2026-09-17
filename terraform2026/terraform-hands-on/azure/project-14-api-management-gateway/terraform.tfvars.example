@@ -1,0 +1,7 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project            = "apim"        # short prefix
+location           = "eastus"      # a region near you
+rate_limit_calls   = 10            # max calls per client per period
+rate_limit_seconds = 1             # the period, in seconds

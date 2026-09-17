@@ -1,0 +1,189 @@
+# Lab Alertmanager config — exercises routing, grouping, inhibition, time
+# intervals and templates without needing real Slack/PagerDuty credentials.
+#
+# Validate: amtool check-config alertmanager.yml
+# Reload:   docker compose restart alertmanager
+# Inspect:  amtool config routes show --alertmanager.url=http://localhost:9093
+#           amtool config routes test --alertmanager.url=http://localhost:9093 \
+#             --verify.receivers=webhook-critical-page severity="page" team="checkout"
+#
+# Rendered notifications land in the webhook sink:
+#   curl -s http://localhost:5001/anything | jq          # last request received
+#   watch -n1 'curl -s http://localhost:5001/anything'   # (httpbin echoes it back)
+
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@lab.local'
+  smtp_require_tls: false
+
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+route:
+  receiver: webhook-catchall          # REQUIRED on the root route
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 15s                     # short, so labs feel responsive
+  group_interval: 2m
+  repeat_interval: 30m
+
+  routes:
+    # 1) The monitoring system's own emergencies --------------------------------
+    - matchers:
+        - alertname =~ "Watchdog|TargetDown|DemoAppMetricsMissing"
+      receiver: webhook-sre
+      group_by: ['alertname', 'job', 'instance']
+      group_wait: 5s
+      group_interval: 1m
+      repeat_interval: 15m
+      continue: false                 # do not let these also hit the generic routes
+
+    # 2) Pages go to the owning team --------------------------------------------
+    - matchers:
+        - severity = "page"
+      routes:
+        - matchers: [ team = "checkout" ]
+          receiver: webhook-checkout-page
+          group_wait: 10s
+          repeat_interval: 15m
+        - matchers: [ team = "payments" ]
+          receiver: webhook-payments-page
+        - matchers: [ team =~ ".+" ]
+          receiver: webhook-critical-page
+      group_by: ['alertname', 'service', 'namespace']
+      group_wait: 10s
+      group_interval: 2m
+      repeat_interval: 30m
+
+    # 3) Warnings become tickets, business hours only ---------------------------
+    - matchers:
+        - severity = "ticket"
+      receiver: webhook-tickets
+      group_by: ['alertname', 'service']
+      group_wait: 1m
+      group_interval: 10m
+      repeat_interval: 4h
+      active_time_intervals: [business-hours-ist]
+
+    # 4) Info is muted overnight and at weekends --------------------------------
+    - matchers:
+        - severity = "info"
+      receiver: webhook-info
+      mute_time_intervals: [nights-and-weekends]
+      repeat_interval: 24h
+
+    # 5) Everything else (including severity=none, e.g. Watchdog duplicates) -----
+    - matchers:
+        - severity =~ "none|.*"
+      receiver: webhook-catchall
+      repeat_interval: 1h
+
+receivers:
+  - name: webhook-catchall
+    webhook_configs:
+      - url: 'http://webhook-sink:80/anything/catchall'
+        send_resolved: true
+        max_alerts: 50
+
+  - name: webhook-sre
+    webhook_configs:
+      - url: 'http://webhook-sink:80/anything/sre'
+        send_resolved: true
+
+  - name: webhook-critical-page
+    webhook_configs:
+      - url: 'http://webhook-sink:80/anything/critical-page'
+        send_resolved: true
+        http_config:
+          follow_redirects: true
+
+  - name: webhook-checkout-page
+    webhook_configs:
+      - url: 'http://webhook-sink:80/anything/checkout-page'
+        send_resolved: true
+
+  - name: webhook-payments-page
+    webhook_configs:
+      - url: 'http://webhook-sink:80/anything/payments-page'
+        send_resolved: true
+
+  - name: webhook-tickets
+    webhook_configs:
+      - url: 'http://webhook-sink:80/anything/tickets'
+        send_resolved: true
+
+  - name: webhook-info
+    webhook_configs:
+      - url: 'http://webhook-sink:80/anything/info'
+        send_resolved: false        # info alerts don't need resolution spam
+
+  # ── Swap these in when you have real credentials ────────────────────────────
+  # - name: slack-checkout
+  #   slack_configs:
+  #     - api_url_file: /etc/alertmanager/secrets/slack-webhook
+  #       channel: '#checkout-alerts'
+  #       send_resolved: true
+  #       title: '{{ template "slack.title" . }}'
+  #       text: '{{ template "slack.text" . }}'
+  #       color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+  #
+  # - name: pagerduty-checkout
+  #   pagerduty_configs:
+  #     - routing_key_file: /etc/alertmanager/secrets/pd-checkout-key
+  #       severity: '{{ if eq .CommonLabels.severity "page" }}critical{{ else }}warning{{ end }}'
+  #       description: '{{ .CommonAnnotations.summary }}'
+  #       details:
+  #         runbook: '{{ .CommonAnnotations.runbook }}'
+  #         dashboard: '{{ .CommonAnnotations.dashboard }}'
+  #         num_alerts: '{{ .Alerts | len }}'
+  #
+  # - name: email-sre
+  #   email_configs:
+  #     - to: 'sre@example.com'
+  #       send_resolved: true
+  #       headers: {Subject: '{{ template "email.subject" . }}'}
+  #       html: '{{ template "email.html" . }}'
+
+# ── Noise suppression ──────────────────────────────────────────────────────────
+inhibit_rules:
+  # A target being completely down explains every other alert about that target.
+  - source_matchers: [ alertname = "TargetDown" ]
+    target_matchers: [ severity =~ "page|ticket" ]
+    equal: ['job', 'instance']
+
+  # A fast SLO burn explains the individual error/latency alerts it subsumes.
+  - source_matchers: [ alertname = "DemoSLOFastBurn" ]
+    target_matchers: [ alertname =~ "HighErrorRatio|HighLatencyP99|DemoSLOSlowBurn" ]
+    equal: ['service']
+
+  # Critical suppresses warning for the same alert & service.
+  - source_matchers: [ severity = "page" ]
+    target_matchers: [ severity = "ticket" ]
+    equal: ['alertname', 'service']
+
+# ── Time windows ───────────────────────────────────────────────────────────────
+# `location` is REQUIRED for sane behaviour: without it, times are UTC and your
+# window lands 5h30m off for anyone in India. (Lab 5 exercises this.)
+time_intervals:
+  - name: nights-and-weekends
+    time_intervals:
+      - times: [{start_time: '19:00', end_time: '23:59'}]
+        weekdays: [monday:friday]
+        location: 'Asia/Kolkata'
+      - times: [{start_time: '00:00', end_time: '09:30'}]
+        weekdays: [monday:friday]
+        location: 'Asia/Kolkata'
+      - weekdays: [saturday, sunday]
+        location: 'Asia/Kolkata'
+
+  - name: business-hours-ist
+    time_intervals:
+      - times: [{start_time: '09:30', end_time: '19:00'}]
+        weekdays: [monday:friday]
+        location: 'Asia/Kolkata'
+
+  - name: change-freeze
+    time_intervals:
+      - months: ['12']
+        days_of_month: ['24:31']
+        location: 'Asia/Kolkata'

@@ -1,0 +1,462 @@
+# =============================================================================
+# Lab 06 — OpenTelemetry Operator CRs (v1beta1)
+# =============================================================================
+# ★★ THIS FILE IS AN ALTERNATIVE TO 01/02/03, NOT AN ADDITION TO THEM.
+#   The Operator renders the DaemonSet/StatefulSet/ConfigMap/Service/RBAC FOR
+#   YOU from these CRs. Applying both means two Collectors fighting over :4317.
+#
+#   Install the Operator first (chart 0.122.0 / Operator v0.158.0):
+#     helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+#     helm install otel-operator open-telemetry/opentelemetry-operator \
+#       -n otel-lab --create-namespace
+#
+# ★★ THREE VERIFIED v1alpha1 -> v1beta1 CHANGES that break old manifests:
+#
+#   1. `spec.config` is a STRUCTURED OBJECT, not a literal YAML string.
+#      v1alpha1:  config: |            v1beta1:  config:
+#                   receivers:                     receivers:
+#                     otlp:                          otlp:
+#                       protocols:                     protocols:
+#                         grpc:                          grpc: {}
+#      ★ Note `grpc: {}` — with a structured object an empty mapping must be
+#        explicit. A bare `grpc:` yields null and fails.
+#
+#   2. Label selectors gained `matchLabels`.
+#      v1alpha1:  serviceMonitorSelector: {key: value}
+#      v1beta1:   serviceMonitorSelector: {matchLabels: {key: value}}
+#
+#   3. ★ `spec.targetAllocator` is NO LONGER a nested block on the Collector.
+#      It became a SEPARATE CRD, `TargetAllocator` (opentelemetry.io/v1alpha1),
+#      linked by a LABEL on the Collector:
+#        labels:
+#          opentelemetry.io/target-allocator: <ta-name>
+#      The old nested form is silently ignored, so your scrape targets vanish.
+#
+#   ★ `Instrumentation` remains at opentelemetry.io/v1alpha1 — it did NOT move
+#     to v1beta1. Mixing the two API versions in one file is correct, not a typo.
+#
+#   ★ Also: the Collector's own image is `spec.image`, and `logging` exporter
+#     examples in older docs are stale — v0.161.0 removed it in favour of `debug`.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# GATEWAY — StatefulSet mode, because tail sampling needs stable identity.
+# -----------------------------------------------------------------------------
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-gateway
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-gateway
+    # ★ Links the separate TargetAllocator CR below. See change (3) at the top.
+    opentelemetry.io/target-allocator: otel-ta
+spec:
+  # ★ mode ∈ {deployment, daemonset, statefulset, sidecar}.
+  #   statefulset => stable ordinals + per-replica PVCs via volumeClaimTemplates,
+  #   which is what a tail-sampling tier needs.
+  mode: statefulset
+  replicas: 3
+  image: otel/opentelemetry-collector-contrib:0.161.0
+  serviceAccount: otel-collector
+
+  # ★★ The Operator renders the pod for you, so these are the knobs that matter.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    # ★ requests == limits for memory => Guaranteed QoS => evicted last.
+    #   memory_limiter.limit_percentage below is relative to THIS number.
+    limits:
+      memory: 2Gi
+
+  # ★ Termination grace must exceed the queue drain time, or a rolling update
+  #   SIGKILLs a gateway holding 20k queued batches.
+  terminationGracePeriodSeconds: 120
+
+  # ★ The Operator creates a Service automatically; this controls its shape.
+  #   `headless: true` is REQUIRED for load_balancing's DNS resolver to see one
+  #   A record per pod.
+  configUpdateStrategy: reload     # ★ or `none`; reload lets the Operator roll pods
+
+  # ★ Pod-level security, inherited by the rendered containers.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+
+  # ★★ The Operator creates a ServiceMonitor for you when this is set, so you do
+  #   not hand-write one for the Collector's own telemetry.
+  observability:
+    metrics:
+      enableMetrics: true
+
+  # ★ Persistent volume per replica, stable across rescheduling.
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+  volumes:
+    - name: state
+      # ★ The Operator merges this with volumeClaimTemplates; naming must match.
+      emptyDir: {}
+
+  volumeMounts:
+    - name: state
+      mountPath: /var/lib/otelcol
+
+  # ★ Feature gates are PROCESS ARGS, not config keys.
+  args:
+    feature-gates: processor.tailsamplingprocessor.recordpolicy
+
+  # ★★ STRUCTURED config — change (1). Note `grpc: {}` and `debug`, not `logging`.
+  config:
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      file_storage:
+        directory: /var/lib/otelcol
+        create_directory: true
+        timeout: 1s
+
+    receivers:
+      otlp:
+        protocols:
+          grpc: {}          # ★ explicit empty map — `grpc:` alone yields null
+          http: {}
+
+      # ★★ THE TARGET ALLOCATOR HANDOFF.
+      #   This receiver MUST be named exactly `prometheus`. The TA looks it up by
+      #   that literal name, so `prometheus/foo` or `prometheus/gateway` does NOT
+      #   work — the TA finds no receiver and your scrape targets silently vanish.
+      #
+      #   ★ The scrape_configs list is DELIBERATELY EMPTY. The TA supplies the
+      #   discovered targets at runtime. Anything you put here competes with the
+      #   TA and is a source of duplicate scrapes.
+      #
+      #   ★★ VERIFIED — THE CR AS WRITTEN DOES NOT VALIDATE STANDALONE. Extract
+      #     spec.config and run the real binary on it:
+      #       receivers::prometheus: no Prometheus scrape_configs or
+      #       target_allocator set
+      #     The receiver's own rule (v0.161.0 README, verbatim):
+      #       "At least one of config.scrape_configs, config.scrape_config_files,
+      #        or target_allocator must be set."
+      #     The OPERATOR injects the `target_allocator` block when it renders the
+      #     ConfigMap. Inject it yourself and you get a second error before it
+      #     passes — both worth knowing, because they tell you exactly what the
+      #     Operator adds:
+      #       target_allocator: {endpoint: ...}
+      #         -> receivers::prometheus::target_allocator: CollectorID is not a valid ID
+      #       target_allocator: {endpoint, interval, collector_id}
+      #         -> VALIDATES CLEAN
+      #     So the rendered block is:
+      #       prometheus:
+      #         target_allocator:
+      #           endpoint: http://otel-ta:8080
+      #           interval: 30s
+      #           collector_id: <pod name>     # ★ per-replica, so the TA can shard
+      #
+      #   ★★ THE LESSON: you cannot fully CI-validate an Operator-managed
+      #     Collector config, because part of it does not exist until the
+      #     Operator renders it. Validate a variant with the injected block added
+      #     (as done here), and treat the CR alone as NOT self-sufficient.
+      #
+      #   ★ Related: the Operator does NOT validate your pipelines either. If the
+      #     metrics pipeline referenced a receiver you forgot to define, you'd
+      #     get this only at Collector startup:
+      #       service::pipelines::metrics: references receiver "prometheus"
+      #       which is not configured
+      prometheus:
+        config:
+          scrape_configs: []
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 50000
+        num_shards: 1
+        decision_cache:
+          # ★★ Both default to 0 = INACTIVE. Set them ≫ num_traces or late spans
+          #   get a fresh independent decision and you get partial traces.
+          sampled_cache_size: 500000
+          non_sampled_cache_size: 500000
+        policies:
+          - name: errors-status
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+          - name: slow
+            type: latency
+            latency:
+              threshold_ms: 1000
+          # ★★ CATCH-ALL. Without one, every trace matching no policy is DROPPED.
+          #   `percent` belongs in rate_allocation ONLY — putting it inside
+          #   composite_sub_policy fails validation with a confusing
+          #   "expected type map[string]interface{}, got unconvertible type int".
+          - name: budget
+            type: composite
+            composite:
+              max_total_spans_per_second: 5000
+              policy_order: [errors-baseline, slow-baseline, everything-else]
+              composite_sub_policy:
+                - name: errors-baseline
+                  type: status_code
+                  status_code:
+                    status_codes: [ERROR]
+                - name: slow-baseline
+                  type: latency
+                  latency:
+                    threshold_ms: 500
+                - name: everything-else
+                  type: always_sample
+              rate_allocation:
+                - percent: 40
+                  policy: errors-baseline
+                - percent: 30
+                  policy: slow-baseline
+                - percent: 30
+                  policy: everything-else
+      batch:
+        send_batch_size: 8192
+        send_batch_max_size: 16384
+        timeout: 5s
+
+    connectors:
+      span_metrics:
+        histogram:
+          explicit:
+            buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+        # ★ service.name / service.instance.id are DEFAULT dimensions.
+        dimensions:
+          - name: http.route
+          - name: k8s.namespace.name
+          - name: k8s.deployment.name
+        aggregation_cardinality_limit: 2000
+        aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+        metrics_expiration: 10m
+
+    exporters:
+      otlp/tempo:
+        endpoint: tempo.observability.svc.cluster.local:4317
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 20000
+          num_consumers: 10
+          storage: file_storage
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        timeout: 30s
+      # ★★ There is NO `loki` exporter. otlphttp against the native OTLP
+      #   endpoint, with the BASE url only (the exporter appends /v1/logs).
+      otlphttp/loki:
+        endpoint: http://loki.observability.svc.cluster.local:3100/otlp
+        encoding: proto
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 20000
+          num_consumers: 10
+          storage: file_storage
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        timeout: 30s
+      prometheus_remote_write/prom:
+        endpoint: http://prometheus.observability.svc.cluster.local:9090/api/v1/write
+        sending_queue:
+          enabled: true
+          queue_size: 20000
+          num_consumers: 10
+          storage: file_storage
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        resource_to_telemetry_conversion:
+          enabled: false
+      debug:
+        verbosity: basic
+        sampling_initial: 2
+        sampling_thereafter: 500
+
+    service:
+      extensions: [health_check, file_storage]
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, tail_sampling, batch]
+          exporters: [otlp/tempo, span_metrics, debug]
+        metrics:
+          receivers: [otlp, prometheus, span_metrics]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus_remote_write/prom, debug]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlphttp/loki, debug]
+
+---
+# -----------------------------------------------------------------------------
+# ★★ TARGET ALLOCATOR — a SEPARATE CRD as of v1beta1 (change 3 above).
+#   This is what lets the Collector own Prometheus scraping in Kubernetes: the TA
+#   discovers ServiceMonitors/PodMonitors, shards the targets across Collector
+#   replicas, and feeds them to the Collector's `prometheus` receiver.
+#
+#   ★★ THE RECEIVER MUST BE NAMED EXACTLY `prometheus`. `prometheus/foo` does NOT
+#     work with the Target Allocator — the TA looks up the receiver by that
+#     literal name. This is why lab-04 used suffixed names deliberately (no TA
+#     there) and why this file uses the bare name.
+# -----------------------------------------------------------------------------
+apiVersion: opentelemetry.io/v1alpha1
+kind: TargetAllocator
+metadata:
+  name: otel-ta
+  namespace: otel-lab
+spec:
+  # ★ Watch Prometheus Operator CRDs. Requires those CRDs installed and RBAC.
+  prometheusCR:
+    enabled: true
+    # ★★ v1beta1 selector shape (change 2): matchLabels, not a bare map.
+    #   An empty selector matches ALL ServiceMonitors cluster-wide, which is
+    #   usually more than you want — scope it.
+    serviceMonitorSelector:
+      matchLabels:
+        otel-target-allocator: "true"
+    podMonitorSelector:
+      matchLabels:
+        otel-target-allocator: "true"
+    # ★ Scrape interval applied to discovered CRs lacking their own.
+    scrapeInterval: 30s
+  # ★ The TA shards targets across Collector replicas; each replica gets a
+  #   disjoint set. Without sharding every replica scrapes every target and you
+  #   get N copies of every series.
+  allocationStrategy: per-node
+
+---
+# -----------------------------------------------------------------------------
+# ★ ZERO-CODE INSTRUMENTATION. The Operator injects an init container that copies
+#   the language agent into a shared volume, then sets env vars on your pod so
+#   the runtime loads it. YOUR APPLICATION CODE DOES NOT CHANGE.
+#
+#   ★ Opt-in is per-workload, via ANNOTATION on the pod template:
+#       instrumentation.opentelemetry.io/inject-python: "true"
+#     (or inject-java / inject-nodejs / inject-dotnet / inject-go /
+#      inject-nginx / inject-apache-httpd / inject-sdk)
+#   ★ Multi-container pods need `.../container-names: "a,b"`, else the agent is
+#     injected into the wrong container or all of them.
+# -----------------------------------------------------------------------------
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: otel-autoinstrumentation
+  namespace: otel-lab
+spec:
+  # ★ Point at the AGENT tier's Service. The agent is node-local, so this hop is
+  #   cheap; the agent then load-balances to a gateway by traceID.
+  exporter:
+    endpoint: http://otel-collector-agent.otel-lab.svc.cluster.local:4317
+
+  propagators:
+    - tracecontext      # ★ W3C Trace Context — the interop default
+    - baggage
+
+  # ★★ parentbased_* is not optional. A bare traceidratio re-rolls per span
+  #   instead of propagating the root decision, which FRAGMENTS traces across
+  #   service boundaries — silently, with no error.
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1.0"     # ★ keep 100% at the SDK; the GATEWAY does tail sampling.
+                        #   Two samplers in series MULTIPLY, which is how teams
+                        #   accidentally sample 1% instead of 10%.
+
+  # ★★ Opt INTO the new semconv attribute names. Without this you get the old
+  #   http.method / http.status_code spelling instead of http.request.method /
+  #   http.response.status_code, and dashboards written against semconv v1.44
+  #   return nothing. Do not flip this casually — it renames attributes on
+  #   every service at once.
+  env:
+    - name: OTEL_SEMCONV_STABILITY_OPT_IN
+      value: http
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: "deployment.environment.name=lab"
+
+  python:
+    env:
+      # ★★ Python auto-instrumentation uses HTTP/protobuf BY DEFAULT, not gRPC.
+      #   So it must point at :4318, not :4317. Getting this wrong means the
+      #   Python service silently exports nothing while every other language
+      #   works — a maddening asymmetry to debug.
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://otel-collector-agent.otel-lab.svc.cluster.local:4318
+      - name: OTEL_METRICS_EXPORTER
+        value: otlp_proto_http
+      - name: OTEL_LOGS_EXPORTER
+        value: otlp_proto_http
+      # ★ Inject trace_id/span_id into stdlib LogRecords so logs correlate.
+      - name: OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED
+        value: "true"
+
+  java:
+    env:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://otel-collector-agent.otel-lab.svc.cluster.local:4317
+    # ★ The Java agent's init container needs room; a too-small limit makes the
+    #   pod fail to start with an OOM in the INIT container, which looks like an
+    #   app problem.
+    resources:
+      requests:
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+  nodejs:
+    env:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://otel-collector-agent.otel-lab.svc.cluster.local:4317
+
+  dotnet:
+    env:
+      # ★ .NET auto-instrumentation also defaults to HTTP/protobuf.
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://otel-collector-agent.otel-lab.svc.cluster.local:4318
+
+  # ★ Opt-in: derive service.name / service.version / service.instance.id from
+  #   the RECOMMENDED Kubernetes labels instead of requiring env vars.
+  #   app.kubernetes.io/name -> service.name
+  #   app.kubernetes.io/version -> service.version
+  #   app.kubernetes.io/instance -> service.instance.id
+  # ★ Off by default, so without this your services all report as
+  #   "unknown_service:python" and every dashboard groups them together.
+  defaults:
+    useLabelsForResourceAttributes: true

@@ -1,0 +1,183 @@
+# Linux host alerting via node_exporter (v1.12).
+# Thresholds are starting points — derive your own from 30 days of history.
+groups:
+  - name: node-and-host
+    rules:
+      # ── CPU ─────────────────────────────────────────────────────────────
+      - alert: HostHighCpuLoad
+        expr: instance:node_cpu_utilisation:ratio > 0.90
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} CPU utilisation {{ $value | humanizePercentage }} for 15m"
+          description: |
+            Cause alert, not a symptom: high CPU alone is not an incident.
+            Check whether the service SLO is also burning before escalating.
+          runbook: "https://runbooks.example.com/host/high-cpu"
+
+      - alert: HostCpuStealHigh
+        expr: avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[5m])) > 0.10
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} CPU steal {{ $value | humanizePercentage }} — noisy neighbour / host oversubscription"
+
+      - alert: HostLoadHighNormalised
+        expr: |
+          node_load5 / count by (instance) (node_cpu_seconds_total{mode="idle"}) > 2
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} load5 is {{ $value }}x the CPU count"
+
+      # ── Memory ──────────────────────────────────────────────────────────
+      - alert: HostOutOfMemory
+        expr: instance:node_memory_utilisation:ratio > 0.92
+        for: 10m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} memory {{ $value | humanizePercentage }} used"
+          description: "OOM killer will start reaping processes shortly."
+          runbook: "https://runbooks.example.com/host/out-of-memory"
+
+      - alert: HostSwapFilling
+        expr: |
+          1 - (node_memory_SwapFree_bytes / clamp_min(node_memory_SwapTotal_bytes, 1)) > 0.80
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} swap {{ $value | humanizePercentage }} used"
+
+      - alert: HostOomKillsDetected
+        expr: increase(node_vmstat_oom_kill[15m]) > 0
+        for: 0m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $value }} OOM kill(s) on {{ $labels.instance }} in the last 15m"
+
+      # ── Disk: space ─────────────────────────────────────────────────────
+      - alert: HostDiskWillFillIn24Hours
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} > 0
+            and
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}[6h], 24 * 3600) < 0
+        for: 30m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.mountpoint }} will be full within 24h"
+          description: "Leading-indicator alert: there is still time to act. Extend the volume or clean up."
+          runbook: "https://runbooks.example.com/host/disk-full"
+
+      - alert: HostDiskSpaceLow
+        expr: instance:node_filesystem_avail:ratio < 0.10
+        for: 10m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+
+      - alert: HostDiskSpaceWarning
+        expr: instance:node_filesystem_avail:ratio < 0.20
+        for: 30m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+
+      - alert: HostInodesWillFillIn24Hours
+        expr: |
+          predict_linear(node_filesystem_files_free{fstype!~"tmpfs|overlay"}[6h], 24 * 3600) < 0
+        for: 30m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.mountpoint }} will run out of inodes within 24h"
+
+      # ── Disk: health & IO ───────────────────────────────────────────────
+      - alert: HostDiskIOHighUtilisation
+        expr: rate(node_disk_io_time_seconds_total[5m]) > 0.90
+        for: 20m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} device {{ $labels.device }} is {{ $value | humanizePercentage }} busy"
+
+      - alert: HostReadonlyFilesystem
+        expr: node_filesystem_readonly == 1
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} is mounted READ-ONLY"
+          description: "Almost always a disk or filesystem error. Applications will fail writes."
+
+      - alert: HostSmartctlDiskFailurePredicted
+        expr: node_smartmon_device_smart_healthy == 0
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "SMART reports {{ $labels.device }} on {{ $labels.instance }} as unhealthy"
+
+      # ── Network ─────────────────────────────────────────────────────────
+      - alert: HostNetworkReceiveErrors
+        expr: |
+          rate(node_network_receive_errs_total{device!~"lo|veth.*|cni.*|docker.*"}[5m]) > 10
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.device }} receiving {{ $value }} errors/sec"
+
+      - alert: HostNetworkTransmitDrops
+        expr: |
+          rate(node_network_transmit_drop_total{device!~"lo|veth.*"}[5m]) > 10
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.device }} dropping {{ $value }} tx packets/sec"
+
+      - alert: HostNetworkNearSaturation
+        expr: |
+          (rate(node_network_receive_bytes_total{device!~"lo|veth.*"}[5m]) * 8)
+            > 0.80 * 1e9      # ← replace 1e9 with your real link speed in bits/sec
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.device }} at {{ $value | humanize }} bit/s"
+
+      # ── Time & liveness ─────────────────────────────────────────────────
+      - alert: HostClockSkew
+        expr: |
+          (node_timex_offset_seconds > 0.05) or (node_timex_offset_seconds < -0.05)
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} clock offset {{ $value }}s — NTP problem"
+          description: "Clock skew breaks TLS, Kerberos, logs ordering and distributed consistency."
+
+      - alert: HostClockNotSynchronising
+        expr: min_over_time(node_timex_sync_status[5m]) == 0
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} is not synchronising its clock"
+
+      - alert: HostRebootedUnexpectedly
+        expr: |
+          (time() - node_boot_time_seconds) < 300
+        for: 0m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} booted {{ $value | humanizeDuration }} ago"
+          description: "Informational unless a reboot was not planned — investigate crashes/kernel panics."
+
+      - alert: HostConntrackNearLimit
+        expr: |
+          node_nf_conntrack_entries / clamp_min(node_nf_conntrack_entries_limit, 1) > 0.85
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} conntrack table {{ $value | humanizePercentage }} full"
+          description: "New connections will be dropped when it fills. Raise nf_conntrack_max."
+
+      - alert: HostFileDescriptorLimit
+        expr: |
+          node_filefd_allocated / clamp_min(node_filefd_maximum, 1) > 0.85
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value | humanizePercentage }} of file descriptors allocated"

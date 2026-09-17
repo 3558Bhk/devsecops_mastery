@@ -1,0 +1,52 @@
+# Lab 02 — Prometheus scrape config.
+#
+# ★ Metrics reach Prometheus here by TWO paths simultaneously, on purpose:
+#     A) SCRAPE (pull)  — the Collector's `prometheus` exporter on :8889
+#     B) REMOTE WRITE (push) — the Collector's `prometheus_remote_write` exporter
+#                         -> http://prometheus:9090/api/v1/write
+#
+#   Both are configured for the same data so you can compare them (Exercise 6 in
+#   the lab README). Running both permanently for the same series is a mistake:
+#   you double your ingest and get duplicate series with different job labels.
+#
+# ★ Prometheus requires CUMULATIVE temporality. The Collector's
+#   span_metrics connector is set to AGGREGATION_TEMPORALITY_CUMULATIVE to match.
+#   Feed it delta and you get silently wrong values. See ../../06-metrics.md
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 15s
+  external_labels:
+    lab: lab-02-instrumented-app
+
+scrape_configs:
+  # (A) Application metrics + span_metrics connector output, via the
+  #     Collector's prometheus exporter.
+  - job_name: otel-collector-export
+    static_configs:
+      - targets: ["collector:8889"]
+        labels:
+          ingest_path: scrape
+
+  # The Collector's OWN internal telemetry — the job that tells you whether the
+  # pipeline is healthy. ★ Works only because service.telemetry binds 0.0.0.0;
+  #   the default is localhost, which a sibling container cannot reach.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["collector:8888"]
+        labels:
+          ingest_path: scrape
+
+  # Tempo's own metrics_generator output arrives by REMOTE WRITE, not scrape.
+  # Nothing to configure here — but scrape Tempo itself so you can see its health.
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

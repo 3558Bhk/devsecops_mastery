@@ -1,0 +1,35 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus                # fixed uid → dashboards are portable across environments
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 15s            # MUST match global.scrape_interval, or panels get gaps
+      httpMethod: POST             # GET breaks on long queries (URL length limits)
+      manageAlerts: false          # Prometheus rules + Alertmanager own alerting in this stack
+      prometheusType: Prometheus
+      prometheusVersion: 3.14.0
+      incrementalQuerying: true
+      incrementalQueryOverlapWindow: 2m
+      cacheLevel: High
+      # exemplarTraceIdDestinations:
+      #   - name: traceID
+      #     datasourceUid: tempo
+
+  # Uncomment when you add Loki (see 10-Logging-and-Tracing)
+  # - name: Loki
+  #   uid: loki
+  #   type: loki
+  #   access: proxy
+  #   url: http://loki:3100
+  #   jsonData:
+  #     derivedFields:
+  #       - name: traceID
+  #         matcherRegex: '"trace_id":"(\w+)"'
+  #         url: '$${__value.raw}'
+  #         datasourceUid: tempo

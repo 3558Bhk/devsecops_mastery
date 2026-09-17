@@ -1,0 +1,219 @@
+# Monitor the monitoring. Install this FIRST — a dead Prometheus is an invisible
+# dead Prometheus, and every other rule in your estate depends on this one working.
+groups:
+  - name: prometheus-self-monitoring
+    rules:
+      # ── Dead man's switch ───────────────────────────────────────────────
+      # Must ALWAYS be firing. Route it to an EXTERNAL service (Healthchecks.io,
+      # Dead Man's Snitch, PagerDuty heartbeat) that pages you when it STOPS.
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: "Health-check alert that must always be firing"
+          description: |
+            This alert is always active. Its only purpose is to prove that the
+            whole pipeline (Prometheus -> Alertmanager -> receiver -> external
+            watchdog) works. If the external watchdog stops receiving it, the
+            monitoring system itself is down.
+
+      # ── Prometheus server health ────────────────────────────────────────
+      - alert: PrometheusDown
+        expr: absent(up{job="prometheus"} == 1)
+        for: 2m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Prometheus is not being scraped / is down"
+          description: "No healthy Prometheus target for 2 minutes. All alerting is blind."
+          runbook: "https://runbooks.example.com/monitoring/prometheus-down"
+
+      - alert: PrometheusConfigReloadFailed
+        expr: prometheus_config_last_reload_successful == 0
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Prometheus failed to reload its configuration on {{ $labels.instance }}"
+          description: |
+            The running config is stale — new rules and targets are NOT active.
+            Check `prometheus_config_last_reload_failure_reason` and run
+            `promtool check config`.
+          runbook: "https://runbooks.example.com/monitoring/config-reload-failed"
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        for: 0m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Prometheus rule evaluations are failing"
+          description: |
+            A recording or alerting rule has a syntax/semantic error, so it is
+            silently producing no data. Fix with `promtool check rules`.
+
+      - alert: PrometheusRuleEvaluationSlow
+        expr: |
+          prometheus_rule_group_last_duration_seconds
+            > prometheus_rule_group_interval_seconds
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "Rule group {{ $labels.rule_group }} takes longer to evaluate than its interval"
+          description: "Rules are falling behind; add recording rules, raise the interval, or reduce cardinality."
+
+      - alert: PrometheusNotConnectedToAlertmanager
+        expr: prometheus_notifications_alertmanagers_health{state="healthy"} < 1
+        for: 10m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Prometheus cannot reach a healthy Alertmanager"
+          description: "Alerts are being evaluated but NOT delivered."
+
+      - alert: PrometheusDroppingAlerts
+        expr: increase(prometheus_notifications_alerts_dropped_total[5m]) > 0
+        for: 0m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Prometheus is DROPPING alerts (send queue full)"
+          description: "{{ $value }} alerts lost in 5m. Alertmanager is unreachable or overloaded."
+
+      - alert: PrometheusNotificationBacklog
+        expr: prometheus_notifications_queue_length > 0
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "Alert notification queue is backed up on {{ $labels.instance }}"
+
+      # ── Targets / scraping ──────────────────────────────────────────────
+      - alert: TargetDown
+        expr: up == 0
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }} has been down for 5m"
+          description: |
+            Scrape target is not responding. 100% of the series from this target
+            are gone, so any alert depending on them is blind.
+          dashboard: "https://grafana.example.com/d/targets?var-job={{ $labels.job }}"
+
+      - alert: TargetMissing
+        # Companion to TargetDown: catches the case where the whole metric
+        # disappears (e.g. a job renamed) rather than the target reporting down.
+        expr: absent(up{job="node"})
+        for: 10m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "No `up` series at all for job=node — service discovery is broken"
+
+      - alert: TargetFlapping
+        expr: changes(up[30m]) > 4
+        for: 0m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} (job={{ $labels.job }}) flapped {{ $value }} times in 30m"
+
+      - alert: ScrapeDurationNearTimeout
+        # NOTE: Prometheus does not export a `scrape_timeout_seconds` series, so
+        # compare against your configured timeout as a literal (default 10s).
+        expr: scrape_duration_seconds > 8
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} (job={{ $labels.job }}) takes {{ $value | humanizeDuration }} to scrape"
+          description: |
+            Approaching the 10s scrape_timeout — this target will soon start
+            failing intermittently. Reduce the number of exported metrics, raise
+            `scrape_timeout` (and `scrape_interval`), or check the target's CPU.
+
+      # ── Storage / capacity ──────────────────────────────────────────────
+      # Two options. Use whichever matches where your TSDB volume lives.
+      - alert: PrometheusTSDBDiskWillFillIn4Hours
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{mountpoint="/prometheus"}[6h], 4 * 3600) < 0
+        for: 30m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Prometheus TSDB volume projected to fill within 4 hours"
+          description: |
+            Reduce retention (`--storage.tsdb.retention.size`) or grow the volume.
+            If node_exporter does not see the TSDB mount, use the variant below
+            with your CSI/PVC metric instead:
+              predict_linear(kubelet_volume_stats_available_bytes{persistentvolumeclaim="prometheus-data"}[6h], 4*3600) < 0
+          runbook: "https://runbooks.example.com/monitoring/tsdb-disk-full"
+
+      - alert: PrometheusWALCorruption
+        expr: increase(prometheus_tsdb_wal_corruptions_total[10m]) > 0
+        for: 0m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Prometheus WAL corruption detected on {{ $labels.instance }}"
+
+      - alert: PrometheusHighCardinality
+        expr: prometheus_tsdb_head_series > 1e6
+        for: 1h
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "Prometheus has {{ $value | humanize }} active series"
+          description: |
+            Run `promtool tsdb analyze` and add `metric_relabel_configs` drops.
+            See 11-Scaling-and-Long-Term-Storage.
+
+      - alert: PrometheusHighSeriesChurn
+        expr: rate(prometheus_tsdb_head_series_created_total[1h]) > 1000
+        for: 1h
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $value | humanize }} new series/second being created"
+          description: "Ephemeral labels (pod names, request ids) are churning the TSDB."
+
+      # ── Alertmanager ────────────────────────────────────────────────────
+      - alert: AlertmanagerDown
+        expr: absent(up{job="alertmanager"} == 1)
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "No healthy Alertmanager — notifications are NOT being delivered"
+
+      - alert: AlertmanagerClusterNotFormed
+        expr: |
+          (count by (job) (alertmanager_cluster_members) < 3)
+            and (alertmanager_cluster_members < 2)
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "Alertmanager HA cluster has fewer than 2 members"
+          description: "Check --cluster.peer DNS and port 9094 reachability. Duplicate notifications may follow."
+
+      - alert: AlertmanagerNotificationsFailing
+        expr: |
+          rate(alertmanager_notifications_failed_total[5m])
+            / clamp_min(rate(alertmanager_notifications_total[5m]), 1e-9) > 0.05
+        for: 10m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.integration }} notifications are failing ({{ $value | humanizePercentage }})"
+          description: "Expired Slack webhook, wrong PagerDuty routing key, SMTP auth failure, or DNS/proxy issue."
+
+      - alert: AlertmanagerSilencesTooMany
+        expr: alertmanager_silences{state="active"} > 20
+        for: 1h
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $value }} active silences — likely blind spots"
+
+      # ── Remote write ────────────────────────────────────────────────────
+      - alert: PrometheusRemoteWriteDroppingSamples
+        expr: increase(prometheus_remote_storage_samples_dropped_total[10m]) > 0
+        for: 0m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "remote_write is DROPPING samples to {{ $labels.remote_name }}"
+          description: "Queue full or endpoint rejecting data. Raise max_shards / check the backend."
+
+      - alert: PrometheusRemoteWriteLagging
+        expr: |
+          (prometheus_remote_storage_highest_timestamp_in_seconds
+            - prometheus_remote_storage_queue_highest_sent_timestamp_seconds) > 300
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "remote_write is {{ $value | humanizeDuration }} behind"

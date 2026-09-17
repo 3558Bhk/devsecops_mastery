@@ -1,0 +1,19 @@
+apiVersion: 1
+
+# ★ Lab 01 has no trace backend — Prometheus only. So there is NO
+#   exemplarTraceIdDestinations here: pointing exemplars at a datasource that
+#   doesn't exist makes Grafana log errors and render broken trace links.
+#   Lab 02 adds Tempo and wires exemplars properly. See its datasources.yaml.
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: lab01-prom
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 5s
+      # --enable-feature=exemplar-storage is on in the compose file so you can
+      # SEE exemplars in the Prometheus UI; linking to traces comes in Lab 02.
+      exemplarTraceIdDestinations: []

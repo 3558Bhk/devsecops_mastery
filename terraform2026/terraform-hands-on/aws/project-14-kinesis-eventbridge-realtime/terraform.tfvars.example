@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project     = "clicklab"        # name prefix
+region      = "us-east-1"       # a region near you
+alert_email = ""                # YOUR email to get "new minute file" alerts, or "" to skip

@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project             = "orderflow"      # name prefix
+region              = "us-east-1"      # a region near you
+big_order_threshold = 1000             # orders above this amount get flagged to a human

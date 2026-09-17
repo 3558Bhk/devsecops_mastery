@@ -1,0 +1,184 @@
+apiVersion: 1
+
+# =============================================================================
+# Lab 05 — the correlation triangle, wired three ways.
+#
+# ★★ THREE VERIFIED PROVISIONING FACTS that stale blog posts get wrong:
+#
+#   1. The Tempo key is `tracesToLogsV2`, not `tracesToLogs`.
+#      Grafana docs, verbatim: "You can provision the trace to logs
+#      configuration using the tracesToLogsV2 block in your data source YAML."
+#
+#   2. The Loki derived-field key is `matcherRegex`, not `regex`.
+#      A `regex:` key is silently ignored — the link just never appears.
+#
+#   3. `matcherType` has exactly two values: `regex` ("Regex in log line") and
+#      `label`. ★ `label` "matches any label: indexed, parsed, or STRUCTURED
+#      METADATA" — which is the only way to catch OTLP-ingested trace IDs, since
+#      those land in metadata, not in the line. (`byName` is not a value.)
+#
+# ★★ AND THE SILENT FAILURE, from the docs verbatim:
+#      "The Loki label name you enter must exactly match the label name on your
+#       Loki streams. A mismatch silently breaks the correlation with no error
+#       shown."
+#    Loki's OTLP ingestion rewrites attribute dots to underscores, so the span
+#    attribute `service.name` is the Loki label `service_name`. Get that wrong
+#    and "Logs for this span" returns nothing, with no error anywhere.
+#
+# ★ The automatic dot-to-underscore remapping applies ONLY to the default tags
+#   (cluster, hostname, namespace, pod, service.name, service.namespace).
+#   "For custom tags, you must specify the remapped name explicitly."
+# =============================================================================
+
+datasources:
+  # ---------------------------------------------------------------------------
+  # LOKI — owns the log -> trace hop.
+  # ---------------------------------------------------------------------------
+  - name: Loki
+    type: loki
+    uid: lab05-loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      maxLines: 1000
+
+      # ★★ TWO derived fields, because this lab has TWO log paths and they carry
+      #   the trace ID in different places.
+      derivedFields:
+        # -----------------------------------------------------------------
+        # MECHANISM 1 — STRUCTURED METADATA (matcherType: label).
+        #
+        # Covers BOTH paths in this lab:
+        #   • OTLP path   — the SDK's LogRecord has first-class traceId/spanId,
+        #                   which Loki's OTLP ingestion maps to metadata.
+        #   • filelog path — transform/correlate-filelog promotes the parsed
+        #                   body["trace_id"] into attributes["trace_id"], which
+        #                   lands in the SAME metadata key.
+        #
+        # ★ That convergence is deliberate and is the point of the exercise:
+        #   normalise the legacy path onto the OTel field name and ONE derived
+        #   field serves every source. Otherwise you maintain a regex per format
+        #   forever — the docs say so explicitly: "If your applications use
+        #   different trace ID field names, you need a separate derived field
+        #   entry for each format. To simplify this, standardize on OpenTelemetry
+        #   structured metadata."
+        # -----------------------------------------------------------------
+        - name: TraceID
+          datasourceUid: lab05-tempo
+          matcherType: label
+          # Matches the label KEY as a regex: catches `trace_id`, `traceid`,
+          # `traceId`. One entry instead of three.
+          matcherRegex: "trace[_]?id"
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace (structured metadata)"
+
+        # -----------------------------------------------------------------
+        # MECHANISM 2 — REGEX IN LOG LINE (matcherType omitted => `regex`).
+        #
+        # For logs whose trace ID is embedded in the MESSAGE TEXT — a legacy
+        # service printing `trace_id=abc...` into its line, before or without any
+        # parsing. Structured metadata cannot help here.
+        #
+        # ★ 32 hex chars is the W3C Trace Context format. `\w{32}` also matches
+        #   32 underscores/digits, which is fine in practice.
+        # -----------------------------------------------------------------
+        - name: TraceIDFromLine
+          datasourceUid: lab05-tempo
+          matcherRegex: "trace_?[iI][dD][\"'=:\\s]+(\\w{32})"
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace (parsed from line)"
+
+        # Span-level jump, so you land on the exact operation, not the whole trace.
+        - name: SpanID
+          datasourceUid: lab05-tempo
+          matcherType: label
+          matcherRegex: "span[_]?id"
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View span"
+
+  # ---------------------------------------------------------------------------
+  # TEMPO — owns the trace -> log and trace -> metric hops.
+  # ---------------------------------------------------------------------------
+  - name: Tempo
+    type: tempo
+    uid: lab05-tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: true
+    jsonData:
+      httpMethod: GET
+      search:
+        hide: false
+      nodeGraph:
+        enabled: true
+      serviceMap:
+        datasourceUid: lab05-prom
+
+      # ★★ TRACE -> LOGS. Note the V2 key.
+      tracesToLogsV2:
+        datasourceUid: lab05-loki
+        tags:
+          - key: service.name
+            value: service_name          # ★ dots -> underscores
+          - key: deployment.environment.name
+            value: deployment_environment_name
+
+        # ★ Docs: "A span's timestamps are precise to the millisecond, but log
+        #   lines are often written slightly before or after the span boundary.
+        #   The default value of 0 can return NO LOGS if timestamps don't align
+        #   exactly." Their suggested start is -2s/+2s; this lab goes wider
+        #   because the app buffers logs on a 2s BSP-style interval.
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+
+        # ★★ false, deliberately. `filterByTraceID` needs trace_id as an indexed
+        #   LABEL. With OTLP ingestion it is STRUCTURED METADATA, so enabling
+        #   this returns an EMPTY result rather than an error. The custom query
+        #   below filters metadata explicitly instead.
+        filterByTraceID: false
+        filterBySpanID: false
+
+        # ★★ The V2 escape hatch, and the correct pattern for OTLP logs.
+        #   `${__tags}` expands to label matchers built from `tags`; the backtick
+        #   filter reads structured metadata. `$$` is escaped for provisioning.
+        customQuery: true
+        query: '{${__tags}} | trace_id=`${__trace.traceId}`'
+
+      # TRACE -> METRICS.
+      tracesToMetrics:
+        datasourceUid: lab05-prom
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+        tags:
+          - key: service.name
+            value: service_name
+          - key: http.route
+            value: http_route
+
+  # ---------------------------------------------------------------------------
+  # PROMETHEUS — owns the metric -> trace hop (exemplars).
+  # ---------------------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    uid: lab05-prom
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 10s
+      # ★★ BOTH label names. The exemplar's trace-ID label depends on WHO
+      #   attached it:
+      #     `traceID`  — Tempo's metrics_generator (send_exemplars: true)
+      #     `trace_id` — the OTel SDK / Collector remote-write path
+      #   Listing only one means half your exemplar diamonds are unclickable,
+      #   with no error anywhere.
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: lab05-tempo
+          urlDisplayLabel: "View trace"
+        - name: trace_id
+          datasourceUid: lab05-tempo
+          urlDisplayLabel: "View trace"

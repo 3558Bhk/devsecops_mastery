@@ -1,0 +1,186 @@
+{
+  "uid": "lab-targets",
+  "title": "Lab · Targets & Prometheus Internals",
+  "description": "Health of the monitoring system itself. If this dashboard is sad, nothing else can be trusted.",
+  "tags": ["lab", "prometheus", "meta"],
+  "timezone": "browser",
+  "editable": true,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-3h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(up, job)", "refId": "job" },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Targets UP / total",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "count(up{job=~\"$job\"} == 1)", "legendFormat": "up", "instant": true },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "count(up{job=~\"$job\"})", "legendFormat": "total", "instant": true }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Active series (cardinality)",
+      "description": "The number that decides how much RAM Prometheus needs. Trend this — a step change means someone shipped an unbounded label.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 500000 }, { "color": "red", "value": 1000000 }] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "prometheus_tsdb_head_series", "legendFormat": "series", "instant": true }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Config reload OK?",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "type": "value", "options": { "0": { "text": "FAILED", "color": "red", "index": 0 }, "1": { "text": "OK", "color": "green", "index": 1 } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "prometheus_config_last_reload_successful", "legendFormat": "{{ job }}", "instant": true }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Alertmanager reachable?",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 }, "1": { "text": "HEALTHY", "color": "green", "index": 1 } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "min(prometheus_notifications_alertmanagers_health{state=\"healthy\"}) or vector(0)", "legendFormat": "healthy AMs", "instant": true }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 5,
+      "title": "Targets that are down",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 5 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false } },
+        "overrides": []
+      },
+      "options": { "showHeader": true, "sortBy": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "up{job=~\"$job\"} == 0", "format": "table", "instant": true }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "Value": true }, "indexByName": {}, "renameByName": { "job": "Job", "instance": "Instance" } } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 6,
+      "title": "Rule group evaluation duration",
+      "description": "If a group's duration approaches its interval, rules fall behind and alerts get late.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 5 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "prometheus_rule_group_last_duration_seconds", "legendFormat": "{{ rule_group }}" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "id": 7,
+      "title": "Top 15 metrics by series count (cardinality offenders)",
+      "description": "The first place to look when Prometheus is slow or OOMKilled. Fix with metric_relabel_configs drops.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 5000 }, { "color": "red", "value": 20000 }] } },
+        "overrides": []
+      },
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showUnfilled": true },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "topk(15, sum by (__name__) (count by (__name__, job) ({job=~\"$job\"})))", "legendFormat": "{{ __name__ }}", "instant": true }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 8,
+      "title": "Notifications: sent vs failed vs queued",
+      "description": "prometheus_notifications_alerts_dropped_total > 0 means alerts were LOST. Failed notifications mean nobody is being told.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(prometheus_notifications_sent_total[5m]))", "legendFormat": "sent/s" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(prometheus_notifications_errors_total[5m]))", "legendFormat": "failed/s" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(prometheus_notifications_queue_length)", "legendFormat": "queue length" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(increase(prometheus_notifications_alerts_dropped_total[5m]))", "legendFormat": "DROPPED in 5m" }
+      ]
+    },
+    {
+      "type": "alertlist",
+      "id": 9,
+      "title": "Currently firing alerts",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 21 },
+      "options": {
+        "viewMode": "list",
+        "showInstances": true,
+        "maxItems": 30,
+        "stateFilter": { "firing": true, "pending": true, "noData": false, "normal": false, "error": true },
+        "alertNameFilter": "",
+        "folderAlertNameFilter": "",
+        "dashboardAlerts": false
+      }
+    }
+  ]
+}

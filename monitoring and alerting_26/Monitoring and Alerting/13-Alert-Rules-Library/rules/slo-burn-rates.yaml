@@ -1,0 +1,213 @@
+# Multi-window, multi-burn-rate SLO alerting (Google SRE Workbook, ch. 5).
+#
+# TEMPLATE PARAMETERS — change these three things everywhere in this file:
+#   1. `job="checkout-api"`      → your service selector
+#   2. `0.001`                  → your allowed error ratio = 1 - SLO  (99.9% ⇒ 0.001)
+#   3. burn-rate multipliers     → 14.4 / 6 / 3 / 1  (see the table below)
+#
+# | Burn rate | Budget burned | Long window | Short window | Severity |
+# |-----------|---------------|-------------|--------------|----------|
+# |   14.4x   | 2%  of 30d    | 1h          | 5m           | page     |
+# |    6x     | 5%  of 30d    | 6h          | 30m          | page     |
+# |    3x     | 10% of 30d    | 1d          | 2h           | ticket   |
+# |    1x     | 10% of 30d    | 3d          | 6h           | ticket   |
+#
+# Both windows must be exceeded simultaneously (the `and`). The long window
+# proves the burn is sustained; the short window proves it is still happening.
+#
+# Prefer generating this with Sloth / Pyrra / the kube-prometheus SLO mixin so
+# the SLO number is defined exactly once. See 09-SLOs-and-Error-Budgets.
+groups:
+  - name: slo.checkout.recording
+    interval: 30s
+    rules:
+      # Valid requests (excludes 4xx — client errors are not our failure).
+      - record: slo:checkout_requests:rate5m
+        expr: sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[5m]))
+
+      # Bad requests.
+      - record: slo:checkout_errors:rate5m
+        expr: sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[5m]))
+
+      # Error RATIO per window — these feed the burn-rate comparisons.
+      - record: slo:checkout_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[5m])), 1e-9)
+      - record: slo:checkout_errors:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[30m]))
+            / clamp_min(sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[30m])), 1e-9)
+      - record: slo:checkout_errors:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[1h]))
+            / clamp_min(sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[1h])), 1e-9)
+      - record: slo:checkout_errors:ratio_rate2h
+        expr: |
+          sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[2h]))
+            / clamp_min(sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[2h])), 1e-9)
+      - record: slo:checkout_errors:ratio_rate6h
+        expr: |
+          sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[6h]))
+            / clamp_min(sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[6h])), 1e-9)
+      - record: slo:checkout_errors:ratio_rate1d
+        expr: |
+          sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[1d]))
+            / clamp_min(sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[1d])), 1e-9)
+      - record: slo:checkout_errors:ratio_rate3d
+        expr: |
+          sum(rate(http_requests_total{job="checkout-api",status=~"5.."}[3d]))
+            / clamp_min(sum(rate(http_requests_total{job="checkout-api",status!~"4.."}[3d])), 1e-9)
+
+      # SLI (good ratio) and current burn rate — for dashboards.
+      - record: sli:checkout_availability:ratio_rate5m
+        expr: 1 - slo:checkout_errors:ratio_rate5m
+
+      - record: slo:checkout_burn_rate:1h
+        expr: slo:checkout_errors:ratio_rate1h / 0.001
+
+      # Error budget remaining over the last 28 days (1.0 = full, 0 = exhausted).
+      # Requires >= 28d of retention or a long-term store.
+      - record: slo:checkout_error_budget_remaining:ratio
+        expr: |
+          1 - (
+            sum(increase(http_requests_total{job="checkout-api",status=~"5.."}[28d]))
+              / clamp_min(sum(increase(http_requests_total{job="checkout-api",status!~"4.."}[28d])), 1e-9)
+          ) / 0.001
+
+  - name: slo.checkout.alerts
+    rules:
+      # ── FAST BURN: 2% of the 30-day budget in 1 hour ────────────────────
+      - alert: CheckoutSLOFastBurn
+        expr: |
+          (
+            slo:checkout_errors:ratio_rate1h > (14.4 * 0.001)
+          and
+            slo:checkout_errors:ratio_rate5m > (14.4 * 0.001)
+          )
+        for: 2m
+        labels:
+          severity: page
+          team: checkout
+          slo: checkout-availability
+          slo_window: "1h"
+          burn_rate: "14.4x"
+        annotations:
+          summary: "Checkout is burning its error budget 14.4x too fast"
+          description: |
+            Error ratio exceeds 1.44% over both 1h and 5m. At this pace 2% of the
+            28-day budget is consumed within an hour. Current traffic:
+            {{ with query "slo:checkout_requests:rate5m" }}{{ . | first | value | humanize }}{{ end }} req/s.
+          runbook: "https://runbooks.example.com/checkout/slo-fast-burn"
+          dashboard: "https://grafana.example.com/d/checkout-slo?from=now-3h"
+
+      # ── MEDIUM BURN: 5% in 6 hours ──────────────────────────────────────
+      - alert: CheckoutSLOMediumBurn
+        expr: |
+          (
+            slo:checkout_errors:ratio_rate6h  > (6 * 0.001)
+          and
+            slo:checkout_errors:ratio_rate30m > (6 * 0.001)
+          )
+        for: 15m
+        labels:
+          severity: page
+          team: checkout
+          slo: checkout-availability
+          slo_window: "6h"
+          burn_rate: "6x"
+        annotations:
+          summary: "Checkout error budget burning 6x too fast (5% in 6h)"
+          runbook: "https://runbooks.example.com/checkout/slo-medium-burn"
+          dashboard: "https://grafana.example.com/d/checkout-slo?from=now-12h"
+
+      # ── SLOW BURN: 10% in 1 day ─────────────────────────────────────────
+      - alert: CheckoutSLOSlowBurn
+        expr: |
+          (
+            slo:checkout_errors:ratio_rate1d > (3 * 0.001)
+          and
+            slo:checkout_errors:ratio_rate2h > (3 * 0.001)
+          )
+        for: 1h
+        labels:
+          severity: ticket
+          team: checkout
+          slo: checkout-availability
+          slo_window: "1d"
+          burn_rate: "3x"
+        annotations:
+          summary: "Checkout error budget burning 3x too fast (10% in 1d)"
+          runbook: "https://runbooks.example.com/checkout/slo-slow-burn"
+
+      # ── DRIP BURN: 10% in 3 days ────────────────────────────────────────
+      - alert: CheckoutSLODripBurn
+        expr: |
+          (
+            slo:checkout_errors:ratio_rate3d > (1 * 0.001)
+          and
+            slo:checkout_errors:ratio_rate6h > (1 * 0.001)
+          )
+        for: 3h
+        labels:
+          severity: ticket
+          team: checkout
+          slo: checkout-availability
+          slo_window: "3d"
+          burn_rate: "1x"
+        annotations:
+          summary: "Checkout is steadily consuming its error budget (10% over 3d)"
+          runbook: "https://runbooks.example.com/checkout/slo-drip-burn"
+
+      # ── Governance: budget nearly gone ──────────────────────────────────
+      - alert: CheckoutErrorBudgetAlmostExhausted
+        expr: slo:checkout_error_budget_remaining:ratio < 0.10
+        for: 30m
+        labels: {severity: ticket, team: checkout, slo: checkout-availability}
+        annotations:
+          summary: "Checkout has less than 10% of its 28-day error budget left"
+          description: "Per the SLO policy this triggers a release freeze. See the policy doc."
+          runbook: "https://runbooks.example.com/checkout/error-budget-policy"
+
+      - alert: CheckoutErrorBudgetExhausted
+        expr: slo:checkout_error_budget_remaining:ratio <= 0
+        for: 10m
+        labels: {severity: page, team: checkout, slo: checkout-availability}
+        annotations:
+          summary: "Checkout 28-day error budget is EXHAUSTED"
+
+      # ── Latency SLO (ratio formulation, 300ms threshold) ────────────────
+      - alert: CheckoutLatencySLOFastBurn
+        expr: |
+          (
+            (
+              1 - (
+                sum(rate(http_request_duration_seconds_count{job="checkout-api"}[1h]))
+                  - sum(rate(http_request_duration_seconds_bucket{job="checkout-api",le="0.3"}[1h]))
+              ) / clamp_min(sum(rate(http_request_duration_seconds_count{job="checkout-api"}[1h])), 1e-9)
+            ) > (14.4 * 0.01)          # latency SLO = 99% under 300ms ⇒ allowed 1%
+          and
+            (
+              1 - (
+                sum(rate(http_request_duration_seconds_count{job="checkout-api"}[5m]))
+                  - sum(rate(http_request_duration_seconds_bucket{job="checkout-api",le="0.3"}[5m]))
+              ) / clamp_min(sum(rate(http_request_duration_seconds_count{job="checkout-api"}[5m])), 1e-9)
+            ) > (14.4 * 0.01)
+          )
+        for: 2m
+        labels: {severity: page, team: checkout, slo: checkout-latency, slo_window: "1h"}
+        annotations:
+          summary: "Checkout latency SLO (99% < 300ms) is burning 14.4x too fast"
+          runbook: "https://runbooks.example.com/checkout/slo-latency"
+
+      # ── Sanity: the SLI itself must exist ───────────────────────────────
+      - alert: CheckoutSLIMetricMissing
+        expr: absent(slo:checkout_requests:rate5m)
+        for: 10m
+        labels: {severity: page, team: checkout}
+        annotations:
+          summary: "The checkout SLI recording rule is producing no data"
+          description: |
+            All SLO alerts for checkout are silently disabled. Either the
+            recording rule was deleted, `http_requests_total{job="checkout-api"}`
+            stopped being exported, or the scrape target is down.

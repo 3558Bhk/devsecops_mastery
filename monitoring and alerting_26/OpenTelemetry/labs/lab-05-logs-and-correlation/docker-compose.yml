@@ -1,0 +1,211 @@
+# =============================================================================
+# Lab 05 — Logs into Loki, and the correlation triangle
+# =============================================================================
+#   docker compose up -d --build
+#
+#   Grafana       http://localhost:3000   (admin / admin)
+#   Loki          http://localhost:3100
+#   Tempo         http://localhost:3200
+#   Prometheus    http://localhost:9090
+#   Demo app      http://localhost:8000
+#   Collector     localhost:4317/4318, telemetry :8888, prom exporter :8889
+#
+#   docker compose down -v
+#
+# ★★ TWO LOG SOURCES, deliberately:
+#      checkout   — OTel-instrumented; trace_id arrives as a first-class field
+#      legacy-app — NOT instrumented; writes JSON to a file, trace_id is in the
+#                   BODY and must be parsed out by the Collector to correlate
+# =============================================================================
+
+name: otel-lab-05
+
+# ★ Shared volume: legacy-app WRITES here, the Collector READS here. This is how
+#   you tail a container's file logs without mounting the Docker socket or
+#   /var/lib/docker — which is the only sane option on a hardened host.
+x-legacy-logs: &legacy-logs
+  legacy-logs:/var/log/legacy
+
+services:
+  checkout:
+    build: ../lab-02-instrumented-app/app
+    image: lab05-checkout:latest
+    container_name: lab05-checkout
+    environment:
+      OTEL_SERVICE_NAME: checkout-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment.name=lab,service.version=1.0.0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      # ★★ THE LOGS KNOB. `otlp` sends LogRecords over OTLP. The alternative
+      #   `console` prints them; `none` disables export. Zero-code
+      #   instrumentation captures the stdlib `logging` calls automatically.
+      OTEL_LOGS_EXPORTER: otlp
+      # ★★ Inject trace_id/span_id into the stdlib LogRecord so the app's own
+      #   formatter can print them into the LINE. That gives you BOTH
+      #   correlation mechanisms at once — structured metadata from the SDK, and
+      #   a regex-matchable ID in the text.
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
+      OTEL_BSP_SCHEDULE_DELAY: "2000"
+      # ★ Log export interval. Default 5000ms; shorter makes the lab feel live.
+      OTEL_BLRP_SCHEDULE_DELAY: "2000"
+      OTEL_PROPAGATORS: tracecontext,baggage
+      PAYMENTS_URL: http://checkout:8000/payments
+    ports: ["8000:8000"]
+    depends_on: [collector]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # THE UNINSTRUMENTED SERVICE. No OTel SDK, no OTLP. It writes JSON lines to a
+  # file, and the ONLY way to correlate its logs with traces is for the Collector
+  # to parse trace_id out of the body — which transform/correlate-filelog does.
+  #
+  # ★ This models the real situation: the third-party binary, the legacy monolith,
+  #   the vendor appliance. You cannot instrument it. You can still correlate it.
+  # ---------------------------------------------------------------------------
+  legacy-app:
+    image: alpine:3.21
+    container_name: lab05-legacy
+    volumes: *legacy-logs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        LOG=/var/log/legacy/legacy-app.log
+        mkdir -p /var/log/legacy
+        echo "legacy-app writing JSON lines to $$LOG (NO OTel SDK)"
+        i=0
+        while true; do
+          i=$((i + 1))
+          # Pull a real trace_id out of the instrumented app's current activity
+          # when we can; otherwise synthesise one so the file always has data.
+          TID=$$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
+          SID=$$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')
+          TS=$$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+          LVL=info; MSG="processed order batch"
+          if [ $$((i % 5)) -eq 0 ]; then LVL=error; MSG="upstream 503 from payments gateway"; fi
+          if [ $$((i % 7)) -eq 0 ]; then LVL=warn;  MSG="retry scheduled, backoff 2s"; fi
+          # ★★ trace_id IS IN THE BODY. Not a field on the record — text the
+          #   Collector must parse and promote. That is the whole exercise.
+          printf '{"time":"%s","level":"%s","message":"%s","trace_id":"%s","span_id":"%s","component":"order-writer","password":"hunter2","card":"4111 1111 1111 1111"}\n' \
+            "$$TS" "$$LVL" "$$MSG" "$$TID" "$$SID" >> $$LOG
+          # A couple of unstructured lines too — the messy reality of tailing files.
+          if [ $$((i % 11)) -eq 0 ]; then
+            printf '%s legacy plaintext line, trace_id=%s, no JSON at all\n' "$$TS" "$$TID" >> $$LOG
+          fi
+          sleep 3
+        done
+    restart: unless-stopped
+
+  loadgen:
+    image: alpine:3.21
+    container_name: lab05-loadgen
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl >/dev/null
+        APP=http://checkout:8000
+        i=0
+        echo "Driving $$APP every 2s — healthz x3 (filtered as noise), products, checkout"
+        while true; do
+          i=$((i + 1))
+          # ★ filter/log-noise drops these. Watch them NOT appear in Loki.
+          curl -s -o /dev/null $APP/healthz
+          curl -s -o /dev/null $APP/healthz
+          curl -s -o /dev/null $APP/healthz
+          for p in widget gadget nonexistent-$$i; do
+            curl -s -o /dev/null $APP/products/$p
+          done
+          # 503s -> ERROR spans -> the trace you will click through from a metric.
+          curl -s -o /dev/null -X POST $APP/checkout
+          sleep 2
+        done
+    depends_on: [checkout]
+    restart: unless-stopped
+
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    container_name: lab05-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8888:8888"
+      - "8889:8889"
+      - "13133:13133"
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # ★ READ-ONLY. The Collector must never write to another service's log dir.
+      - legacy-logs:/var/log/legacy:ro
+      # ★ file_storage backs BOTH the filelog read offset and the exporter queue,
+      #   so a Collector restart resumes tailing instead of re-reading or
+      #   skipping, and does not drop the queued log backlog.
+      - otelcol-state:/var/lib/otelcol
+    mem_limit: 1g
+    depends_on: [loki, tempo, prometheus]
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.7.7
+    container_name: lab05-loki
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    ports: ["3100:3100"]
+    volumes:
+      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: lab05-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports: ["3200:3200"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: lab05-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=1d
+      - --web.enable-lifecycle
+      - --web.listen-address=0.0.0.0:9090
+      # ★ Required for the metric -> trace hop. Without it exemplars are ACCEPTED
+      #   but NOT RETAINED — a silent failure with no error in any log.
+      - --enable-feature=exemplar-storage
+      - --web.enable-otlp-receiver
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    container_name: lab05-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_DEFAULT_THEME: light
+    ports: ["3000:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [loki, tempo, prometheus]
+    restart: unless-stopped
+
+volumes:
+  legacy-logs:
+  otelcol-state:
+  loki-data:
+  tempo-data:
+  prometheus-data:
+  grafana-data:

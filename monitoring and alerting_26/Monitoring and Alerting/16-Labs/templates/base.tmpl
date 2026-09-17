@@ -1,0 +1,117 @@
+{{/*
+  Shared notification templates.
+  Reference: https://prometheus.io/docs/alerting/latest/notifications/
+
+  Data available on `.`:
+    .Receiver            receiver name
+    .Status              "firing" | "resolved"
+    .Alerts              list; also .Alerts.Firing / .Alerts.Resolved
+    .GroupLabels         labels the group was grouped by
+    .CommonLabels        labels present on EVERY alert in the group
+    .CommonAnnotations   annotations present on EVERY alert in the group
+    .ExternalURL         this Alertmanager's URL
+
+  Per alert (template.Alert): .Labels .Annotations .StartsAt .EndsAt .GeneratorURL
+  .Fingerprint .Status .SilenceURL is NOT a field — build the link yourself with
+  the "__alert_silence_link" helper defined below.
+
+  GOTCHA: .CommonAnnotations.X renders EMPTY if even one alert in the group
+  lacks annotation X. Use `(index .Alerts 0).Annotations.X` when you need one.
+*/}}
+
+{{ define "__alert_silence_link" -}}
+{{ .ExternalURL }}/#/silences/new?filter=%7B{{ range .CommonLabels.SortedPairs -}}
+{{ urlquery .Name }}%3D"{{ urlquery .Value }}"%2C%20{{ end -}}%7D
+{{- end }}
+
+{{ define "__alert_severity_color" -}}
+{{ if eq .Status "resolved" -}}
+good
+{{- else if eq .CommonLabels.severity "page" -}}
+danger
+{{- else if eq .CommonLabels.severity "ticket" -}}
+warning
+{{- else -}}
+#439FE0
+{{- end -}}
+{{- end }}
+
+{{/* ── Slack ─────────────────────────────────────────────────────────────── */}}
+
+{{ define "slack.title" -}}
+[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}{{ if .CommonLabels.service }} — {{ .CommonLabels.service }}{{ end }}
+{{- end }}
+
+{{/*
+  NOTE ON FUNCTIONS: Alertmanager exposes text/template + a specific function
+  map (title, toUpper, toLower, join, match, reReplaceAll, safeHTML, stringSlice,
+  since, humanize*, urlquery, printf, first, sortByLabel, ...) — it does NOT
+  expose the full Sprig set, so `default`, `ternary`, `coalesce` etc. are NOT
+  available. Use `{{ if x }}...{{ else }}...{{ end }}` instead.
+*/}}
+
+{{ define "slack.text" -}}
+{{ range .Alerts -}}
+*{{ with .Labels.severity }}{{ . | toUpper }}{{ else }}INFO{{ end }}* — {{ .Annotations.summary }}
+• team: `{{ .Labels.team }}`  service: `{{ .Labels.service }}`  instance: `{{ .Labels.instance }}`
+• started: {{ .StartsAt.Format "2006-01-02 15:04:05 MST" }} ({{ .StartsAt | since | humanizeDuration }} ago)
+{{ if .Annotations.description }}• {{ .Annotations.description }}
+{{ end }}• Links: {{ if .Annotations.runbook }}<{{ .Annotations.runbook }}|Runbook> · {{ end }}{{ if .Annotations.dashboard }}<{{ .Annotations.dashboard }}|Dashboard> · {{ end }}<{{ .GeneratorURL }}|Query> · <{{ template "__alert_silence_link" $ }}|Silence>
+{{ end -}}
+{{- end }}
+
+{{/* ── Email ─────────────────────────────────────────────────────────────── */}}
+
+{{ define "email.subject" -}}
+[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}{{ if .CommonLabels.service }} ({{ .CommonLabels.service }}){{ end }} — {{ .Alerts | len }} alert{{ if ne (len .Alerts) 1 }}s{{ end }}
+{{- end }}
+
+{{ define "email.html" -}}
+<html><body style="font-family:-apple-system,Segoe UI,sans-serif;color:#111">
+  <h2 style="margin-bottom:4px">{{ .Status | toUpper }}: {{ .GroupLabels.alertname }}</h2>
+  <p style="color:#555">
+    {{ .Alerts | len }} alert{{ if ne (len .Alerts) 1 }}s{{ end }} in group
+    {{ range .GroupLabels.SortedPairs }}<code>{{ .Name }}={{ .Value }}</code> {{ end }}
+    &middot; <a href="{{ .ExternalURL }}">Alertmanager</a>
+  </p>
+  <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;font-size:14px">
+    <tr style="background:#f5f5f5">
+      <th align="left">Severity</th><th align="left">Summary</th>
+      <th align="left">Service</th><th align="left">Instance</th>
+      <th align="left">Started</th><th align="left">Links</th>
+    </tr>
+    {{ range .Alerts }}
+    <tr>
+      <td>{{ .Labels.severity }}</td>
+      <td>{{ .Annotations.summary }}{{ if .Annotations.description }}<br><small style="color:#666">{{ .Annotations.description }}</small>{{ end }}</td>
+      <td>{{ .Labels.service }}</td>
+      <td>{{ .Labels.instance }}</td>
+      <td>{{ .StartsAt.Format "Jan 2 15:04 MST" }}</td>
+      <td>
+        <a href="{{ .Annotations.runbook }}">Runbook</a> &middot;
+        <a href="{{ .Annotations.dashboard }}">Dashboard</a> &middot;
+        <a href="{{ .GeneratorURL }}">Query</a> &middot;
+        <a href='{{ template "__alert_silence_link" $ }}'>Silence</a>
+      </td>
+    </tr>
+    {{ end }}
+  </table>
+  <p style="color:#888;font-size:12px;margin-top:12px">
+    Sent by Alertmanager at {{ .ExternalURL }}. Do not reply — silence via the link above.
+  </p>
+</body></html>
+{{- end }}
+
+{{/* ── PagerDuty / Opsgenie short description ───────────────────────────── */}}
+
+{{ define "pagerduty.description" -}}
+{{ .CommonLabels.alertname }}: {{ .CommonAnnotations.summary }} ({{ .Alerts.Firing | len }} firing)
+{{- end }}
+
+{{/* ── Plain-text fallback for webhooks and terminal debugging ──────────── */}}
+
+{{ define "plain.text" -}}
+{{ .Status | toUpper }} — {{ .GroupLabels.alertname }} ({{ .Alerts | len }} alerts)
+{{ range .Alerts }}  * [{{ .Labels.severity }}] {{ .Annotations.summary }} ({{ .Labels.service }}/{{ .Labels.instance }}) since {{ .StartsAt.Format "15:04" }}
+{{ end -}}
+{{- end }}

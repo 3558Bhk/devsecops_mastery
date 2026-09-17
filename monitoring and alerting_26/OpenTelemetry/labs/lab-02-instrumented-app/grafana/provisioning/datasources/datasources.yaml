@@ -1,0 +1,193 @@
+apiVersion: 1
+
+# =============================================================================
+# ★★ THE CORRELATION WIRING — the highest-value configuration in this folder.
+# =============================================================================
+# Three links turn four separate tools into one investigation:
+#
+#   metric -> trace   : exemplarTraceIdDestinations on the Prometheus datasource
+#   trace  -> logs    : tracesToLogs on the Tempo datasource
+#   trace  -> metrics : tracesToMetrics + serviceMap on the Tempo datasource
+#   log    -> trace   : derivedFields on the Loki datasource
+#
+# Without these an engineer sees a latency spike, opens the trace UI, and
+# manually guesses a time window and a service. With them, they click a point on
+# the graph and land on a representative trace, then jump to that trace's logs.
+#
+# This is configuration, not infrastructure. See ../../13-backends.md and
+# ../../17-migration-and-adoption.md ("Level 3 — Correlated").
+# =============================================================================
+
+datasources:
+  # ------------------------------------------------------------------ Tempo
+  - name: Tempo
+    type: tempo
+    uid: lab02-tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: true
+    jsonData:
+      httpMethod: GET
+
+      # -----------------------------------------------------------------------
+      # TRACE -> LOGS. Click a span, see that span's logs.
+      #
+      # ★★ The provisioning key is `tracesToLogsV2`. Verified against the current
+      #   Grafana docs ("Configure trace to logs correlation"):
+      #     "You can provision the trace to logs configuration using the
+      #      tracesToLogsV2 block in your data source YAML file."
+      #   Plain `tracesToLogs` is the legacy V1 shape. Grafana does not reject it
+      #   loudly, which is why stale examples keep circulating.
+      #
+      # ★★ V2 adds `customQuery` + `query`, which is what you actually want with
+      #   OTLP-ingested logs — because trace_id is STRUCTURED METADATA, not a
+      #   label, so `filterByTraceID: true` cannot index on it. The query below
+      #   filters it explicitly instead.
+      # -----------------------------------------------------------------------
+      tracesToLogsV2:
+        datasourceUid: lab02-loki
+
+        # ★ Map a SPAN attribute to a LOKI LABEL. Left = span attribute name,
+        #   right = Loki label name. Loki promotes service.name to the label
+        #   `service_name` (dots -> underscores) — see loki-config.yaml.
+        #
+        # ★★ From the docs, verbatim: "The Loki label name you enter must exactly
+        #   match the label name on your Loki streams. **A mismatch silently
+        #   breaks the correlation with no error shown.**"
+        #
+        # ★ And the remapping subtlety: "The automatic dot-to-underscore
+        #   remapping only applies to these DEFAULT tags: cluster, hostname,
+        #   namespace, pod, service.name, service.namespace. **For custom tags,
+        #   you must specify the remapped name explicitly.**"
+        tags:
+          - key: service.name
+            value: service_name
+          - key: k8s.pod.name
+            value: pod
+
+        # ★ Widen the window. Docs: "A span's timestamps are precise to the
+        #   millisecond, but log lines are often written slightly before or after
+        #   the span boundary. The default value of 0 can return NO LOGS if
+        #   timestamps don't align exactly." Suggested starting point -2s/+2s;
+        #   this lab uses a wider window because the app buffers logs.
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+
+        # ★★ false on purpose, with a reason. `filterByTraceID` requires trace_id
+        #   to be an indexed LABEL. With OTLP ingestion it is STRUCTURED METADATA,
+        #   so enabling this yields an empty result rather than an error.
+        #   Instead we filter it in the custom query below.
+        filterByTraceID: false
+        filterBySpanID: false
+
+        # ★★ The V2 escape hatch. `${__tags}` expands to the label matchers built
+        #   from `tags`; the backtick filter reads structured metadata directly.
+        #   `$$` is escaped because Grafana provisioning YAML interpolates `$`.
+        customQuery: true
+        query: '{${__tags}} | trace_id=`${__trace.traceId}`'
+
+      # TRACE -> METRICS. Click a span, see that service's metrics.
+      tracesToMetrics:
+        datasourceUid: lab02-prom
+        tags:
+          - key: service.name
+            value: service
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+
+      # SERVICE MAP, drawn from Tempo's metrics_generator remote-written to Prometheus.
+      serviceMap:
+        datasourceUid: lab02-prom
+
+      # NODE GRAPH: parent/child span relationships drawn as a diagram.
+      nodeGraph:
+        enabled: true
+
+      # TraceQL search UI.
+      search:
+        hide: false
+
+  # ------------------------------------------------------------------- Loki
+  - name: Loki
+    type: loki
+    uid: lab02-loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      maxLines: 1000
+
+      # LOG -> TRACE. ★ Two mechanisms are configured because Loki 3 gives you both.
+      derivedFields:
+        # (1) From the log LINE. Our app's formatter prints
+        #     "[trace_id=... span_id=...]" — see app/main.py. The regex reads it
+        #     back out of the message text.
+        - name: trace_id
+          datasourceUid: lab02-tempo
+          # ★★ The provisioning key is `matcherRegex`, NOT `regex`. Verified in
+          #   the Grafana Loki data-source docs' own provisioning example. A
+          #   `regex:` key is ignored, so the derived field silently never
+          #   matches and the "View trace" link simply does not appear.
+          matcherRegex: "trace_id=(\\w+)"
+          # ★ Omit matcherType => "Regex in log line" (the default).
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace"
+
+        # (2) From STRUCTURED METADATA. With Loki 3 + OTLP ingestion, the OTel
+        #     traceId lands in metadata[trace_id] (dots become underscores), not
+        #     in the line. Grafana exposes structured metadata to derived fields,
+        #     so a second rule catches logs that did NOT print the ID themselves —
+        #     e.g. third-party libraries you don't control.
+        #
+        #     ★ This is the important one at scale: you cannot edit every
+        #       library's log formatter, but you CAN rely on the SDK injecting
+        #       trace context into the log record.
+        - name: TraceID
+          datasourceUid: lab02-tempo
+          # ★★ matcherType: label — matches against the LABEL KEY as a regex, and
+          #   per the Grafana docs it "matches any label: indexed, parsed, or
+          #   STRUCTURED METADATA". That is exactly what we need, because OTLP
+          #   ingestion puts trace_id in structured metadata rather than the line.
+          #   The pattern `trace[_]?id` catches both `traceid` and `trace_id`.
+          #
+          #   ★ `byName` is NOT a valid value — the two types are `regex`
+          #     ("Regex in log line") and `label`. Confirmed from the Grafana
+          #     community thread where a user had to read the SOURCE to find the
+          #     field: "there is a matcherType field, which can be set to label".
+          matcherType: label
+          matcherRegex: "trace[_]?id"
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace (metadata)"
+
+  # -------------------------------------------------------------- Prometheus
+  - name: Prometheus
+    type: prometheus
+    uid: lab02-prom
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 10s
+
+      # ★ METRIC -> TRACE. Exemplars are the little diamonds on a graph; clicking
+      #   one opens the trace that produced that sample.
+      #
+      #   Two names are listed because the label depends on WHO attached the
+      #   exemplar:
+      #     - Tempo's metrics_generator with send_exemplars: true  -> traceID
+      #     - OTel SDK / Collector remote-write                   -> trace_id
+      #   Listing both is defensive and costs nothing.
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: lab02-tempo
+          urlDisplayLabel: "View trace"
+        - name: trace_id
+          datasourceUid: lab02-tempo
+          urlDisplayLabel: "View trace"
+
+      # Prometheus 3.x needs --enable-feature=exemplar-storage (set in compose).
+      # ★ Without that flag exemplars are accepted but NOT retained, and the
+      #   diamonds silently never appear. This is a very common "why is my
+      #   metric->trace link not working" cause.

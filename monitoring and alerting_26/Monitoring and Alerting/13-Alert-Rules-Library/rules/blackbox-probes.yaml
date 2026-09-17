@@ -1,0 +1,114 @@
+# Synthetic monitoring with blackbox_exporter.
+# Assumes the probe job from 02-Prometheus-Core (metrics_path=/probe, module=http_2xx)
+# producing: probe_success, probe_duration_seconds, probe_http_status_code,
+#            probe_http_duration_seconds{phase=...}, probe_ssl_earliest_cert_expiry,
+#            probe_dns_lookup_time_seconds, probe_all_success
+groups:
+  - name: blackbox-probes
+    rules:
+      - alert: EndpointDown
+        expr: probe_success == 0
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Probe of {{ $labels.instance }} has failed for 5m"
+          description: |
+            An external, synthetic request to this endpoint is failing — this is
+            the closest thing to "a real user cannot reach us".
+          runbook: "https://runbooks.example.com/probes/endpoint-down"
+          dashboard: "https://grafana.example.com/d/probes?var-target={{ $labels.instance }}"
+
+      - alert: EndpointFlapping
+        expr: avg_over_time(probe_success[30m]) < 1 and avg_over_time(probe_success[30m]) > 0
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} probe succeeded only {{ $value | humanizePercentage }} of the time in 30m"
+          description: "Intermittent failures are often worse than hard failures — load balancer, DNS, or one bad replica."
+
+      - alert: EndpointReturningNon2xx
+        expr: probe_http_status_code >= 400
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} is returning HTTP {{ $value }}"
+
+      - alert: EndpointSlow
+        expr: probe_duration_seconds > 2
+        for: 10m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "Total probe time to {{ $labels.instance }} is {{ $value | humanizeDuration }} (>2s)"
+
+      - alert: EndpointTLSHandshakeSlow
+        expr: probe_http_duration_seconds{phase="processing"} > 1
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} '{{ $labels.phase }}' phase took {{ $value | humanizeDuration }}"
+
+      # ── Certificate expiry: the classic "we had 7 days of warning" ──────
+      - alert: TLSCertExpiringIn7Days
+        expr: |
+          (probe_ssl_earliest_cert_expiry - time()) / 86400 < 7
+        for: 1h
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "TLS certificate for {{ $labels.instance }} expires in {{ $value }} days"
+          description: "Renew now. cert-manager / ACM renewal has failed or is not configured for this host."
+          runbook: "https://runbooks.example.com/probes/cert-expiry"
+
+      - alert: TLSCertExpiringIn30Days
+        expr: |
+          (probe_ssl_earliest_cert_expiry - time()) / 86400 < 30
+        for: 6h
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "TLS certificate for {{ $labels.instance }} expires in {{ $value }} days"
+
+      - alert: TLSChainInvalid
+        expr: probe_ssl_cert_chain_verified == 0
+        for: 15m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "TLS certificate chain for {{ $labels.instance }} does not verify"
+          description: "Missing intermediate certificate, wrong hostname, or an untrusted root."
+
+      # ── DNS ─────────────────────────────────────────────────────────────
+      - alert: DNSProbeFailing
+        expr: probe_dns_lookup_failed == 1
+        for: 10m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "DNS lookup for {{ $labels.instance }} is failing"
+
+      - alert: DNSLookupSlow
+        expr: probe_dns_lookup_time_seconds > 1
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "DNS resolution for {{ $labels.instance }} took {{ $value | humanizeDuration }}"
+
+      # ── TCP / generic ───────────────────────────────────────────────────
+      - alert: TCPConnectFailing
+        expr: probe_success{module=~"tcp_.*"} == 0
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "TCP probe of {{ $labels.instance }} is failing (port closed / firewalled)"
+
+      # ── The prober itself ───────────────────────────────────────────────
+      - alert: BlackboxExporterDown
+        expr: absent(up{job="blackbox-exporter"} == 1)
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "blackbox_exporter is down — ALL synthetic probes are blind"
+          description: "Silence the EndpointDown alerts or, better, fix the exporter immediately."
+
+      - alert: ProbesNotConfigured
+        expr: absent(probe_success)
+        for: 15m
+        labels: {severity: ticket, team: sre}
+        annotations:
+          summary: "No probe_success series exist — the probe job is misconfigured or has no targets"

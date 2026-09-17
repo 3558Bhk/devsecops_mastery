@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars, then edit the values:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project     = "hello"     # your project name — becomes part of the bucket name
+environment = "dev"       # dev | staging | prod (anything else fails validation)
+versioning  = true        # keep previous versions of objects? true/false

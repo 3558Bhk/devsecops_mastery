@@ -1,0 +1,5 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project = "ordersapi"       # name prefix
+region  = "us-east-1"       # a region near you

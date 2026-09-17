@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project       = "iot"           # short prefix
+location      = "eastus"        # a region near you
+hot_threshold = 80              # readings above this land in the blob

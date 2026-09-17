@@ -1,0 +1,18 @@
+# ======================================================================
+#  providers.tf
+#  Terraform settings (required_providers) + provider configuration —
+#  "which providers, which versions, and how Terraform logs in to each cloud."
+#  (the standard layout this folder follows: providers.tf | variables.tf |
+#   main.tf | outputs.tf — one job per file)
+# ======================================================================
+
+terraform {                                      # the terraform block: Terraform-level settings
+  required_version = ">= 1.5"                    # minimum Terraform version
+  required_providers {
+    azurerm = { source = "hashicorp/azurerm", version = "~> 5.0" }   # Azure provider
+  }
+}
+
+provider "azurerm" {                             # configure the Azure provider
+  features {}                                     # empty features block (required)
+}

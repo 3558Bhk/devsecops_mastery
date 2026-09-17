@@ -1,0 +1,143 @@
+# =============================================================================
+# Lab 04 — Metrics into Prometheus: temporality, naming, and the three paths
+# =============================================================================
+#   docker compose up -d --build
+#
+#   Grafana       http://localhost:3000   (admin / admin)
+#   Prometheus    http://localhost:9090
+#   Tempo         http://localhost:3200
+#   Demo app      http://localhost:8000
+#   Collector     localhost:4317/4318, telemetry :8888, prom exporter :8889
+#
+#   docker compose down -v
+#
+# ★ Prometheus is configured to receive metrics by BOTH pull (scrape the
+#   Collector's prometheus exporter) and push (remote-write). Seeing the same
+#   data arrive two ways is the point — Exercise 6 compares them.
+# =============================================================================
+
+name: otel-lab-04
+
+services:
+  checkout:
+    build: ../lab-02-instrumented-app/app
+    image: lab04-checkout:latest
+    container_name: lab04-checkout
+    environment:
+      OTEL_SERVICE_NAME: checkout-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment.name=lab,service.version=1.0.0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
+      OTEL_BSP_SCHEDULE_DELAY: "2000"
+      OTEL_PROPAGATORS: tracecontext,baggage
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+      # ★★ THE TEMPORALITY KNOB. This is what Exercise 1 flips.
+      #   cumulative = what Prometheus wants. delta = what most cloud backends
+      #   and many SDKs emit by default. Sending delta to Prometheus without
+      #   conversion produces SILENTLY WRONG values, not an error.
+      OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: cumulative
+      PAYMENTS_URL: http://checkout:8000/payments
+    ports: ["8000:8000"]
+    depends_on: [collector]
+    restart: unless-stopped
+
+  loadgen:
+    image: alpine:3.21
+    container_name: lab04-loadgen
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl >/dev/null
+        APP=http://checkout:8000
+        i=0
+        echo "Driving $APP every 2s (including 404s and 503s)"
+        while true; do
+          i=$((i + 1))
+          curl -s -o /dev/null $APP/healthz
+          curl -s -o /dev/null $APP/healthz
+          curl -s -o /dev/null $APP/healthz
+          for p in widget gadget nonexistent-$$i; do
+            curl -s -o /dev/null $APP/products/$p
+          done
+          curl -s -o /dev/null -X POST $APP/checkout
+          sleep 2
+        done
+    depends_on: [checkout]
+    restart: unless-stopped
+
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    container_name: lab04-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8888:8888"     # internal telemetry
+      - "8889:8889"     # ★ prometheus exporter — PATH B (pull)
+      - "13133:13133"
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - otelcol-queue:/var/lib/otelcol
+    mem_limit: 1g
+    depends_on: [tempo, prometheus]
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: lab04-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports: ["3200:3200"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: lab04-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=1d
+      - --web.enable-lifecycle
+      - --web.listen-address=0.0.0.0:9090
+      - --enable-feature=exemplar-storage
+      # ★★ Accepts OTLP metrics DIRECTLY at /api/v1/otlp/v1/metrics.
+      #   This is a fourth path, not used by default in this lab but enabled so
+      #   you can try it in Exercise 7 without restarting Prometheus.
+      - --web.enable-otlp-receiver
+      # ★ Native histograms are how exponential histograms land without
+      #   exploding into fixed buckets. Off by default; Exercise 8 turns it on.
+      # - --enable-feature=native-histograms
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    container_name: lab04-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_DEFAULT_THEME: light
+    ports: ["3000:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus, tempo]
+    restart: unless-stopped
+
+volumes:
+  otelcol-queue:
+  tempo-data:
+  prometheus-data:
+  grafana-data:

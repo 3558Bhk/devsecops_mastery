@@ -1,0 +1,438 @@
+# =============================================================================
+# Lab 06 — An instrumented workload, and the monitoring for the Collector itself
+# =============================================================================
+# ★ Two independent things in this file:
+#     A. A Deployment that opts INTO zero-code instrumentation via annotation
+#     B. The ServiceMonitor/PodMonitor that the Target Allocator discovers
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# A. ZERO-CODE INSTRUMENTATION VIA ANNOTATION
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: otel-lab
+  labels:
+    app: checkout
+    # ★★ THE RECOMMENDED KUBERNETES LABELS. With
+    #   `defaults.useLabelsForResourceAttributes: true` on the Instrumentation CR,
+    #   the Operator derives resource attributes from THESE:
+    #     app.kubernetes.io/name     -> service.name
+    #     app.kubernetes.io/version  -> service.version
+    #     app.kubernetes.io/instance -> service.instance.id
+    #     app.kubernetes.io/part-of  -> (grouping)
+    #   ★ Without that opt-in every service reports as "unknown_service:python"
+    #     and all your dashboards collapse into one bucket. That is the single
+    #     most common "why does everything show as unknown_service" cause.
+    app.kubernetes.io/name: checkout-service
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/instance: checkout
+    app.kubernetes.io/part-of: shop
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+        app.kubernetes.io/name: checkout-service
+        app.kubernetes.io/version: "1.0.0"
+        # ★ Discovered by the Target Allocator, which selects on this label.
+        otel-target-allocator: "true"
+      annotations:
+        # ★★ THE INJECTION SWITCH. This annotation is what makes the Operator's
+        #   mutating webhook add an init container (which copies the language
+        #   agent into a shared volume) and set the OTEL_* env vars on your
+        #   container. YOUR APPLICATION CODE AND IMAGE DO NOT CHANGE.
+        #
+        #   ★ It is language-specific: inject-python, inject-java, inject-nodejs,
+        #     inject-dotnet, inject-go, inject-nginx, inject-apache-httpd,
+        #     inject-sdk. The value is "true" (use the namespace's default
+        #     Instrumentation CR) or the NAME of a specific CR.
+        #
+        #   ★★ THE MOST COMMON FAILURE: you add the annotation to the DEPLOYMENT
+        #     metadata instead of the POD TEMPLATE metadata. Nothing happens,
+        #     nothing errors, and no init container appears. The webhook watches
+        #     PODS, so the annotation must be on spec.template.metadata.
+        instrumentation.opentelemetry.io/inject-python: "true"
+
+        # ★ MULTI-CONTAINER PODS. Without this, injection targets are ambiguous.
+        #   Name exactly the containers that should get the agent:
+        #     instrumentation.opentelemetry.io/container-names: "checkout,worker"
+        #   There are also per-language variants (java-container-names,
+        #   python-container-names) for pods mixing languages.
+        # ★ Init containers need explicit inclusion too:
+        #     instrumentation.opentelemetry.io/container-names: "my-init-job,myapp"
+
+        # ★★ SIDECAR INJECTION is a SEPARATE annotation with a different prefix.
+        #   Do not confuse the two:
+        #     instrumentation.opentelemetry.io/inject-*  -> agent into YOUR container
+        #     sidecar.opentelemetry.io/inject            -> a Collector CONTAINER
+        #   A sidecar Collector is the third deployment mode, useful when a pod
+        #   must not share a node agent (strict tenancy, huge volume).
+        # sidecar.opentelemetry.io/inject: "true"
+    spec:
+      containers:
+        - name: checkout
+          image: lab06-checkout:latest     # built from ../../lab-02-instrumented-app/app
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # ★ ONLY set what the Instrumentation CR does not. Duplicating
+            #   OTEL_EXPORTER_OTLP_ENDPOINT here OVERRIDES the CR, which is how
+            #   teams end up with per-service endpoints they cannot audit.
+            - name: OTEL_SERVICE_NAME
+              value: checkout-service
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # ★ the injected agent writes to a
+                                            #   shared emptyDir; read-only root
+                                            #   can block it depending on runtime
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout
+  namespace: otel-lab
+  labels:
+    app: checkout
+    otel-target-allocator: "true"
+spec:
+  selector:
+    app: checkout
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+
+---
+# -----------------------------------------------------------------------------
+# B. SERVICEMONITOR — discovered by the Target Allocator, NOT by the Collector
+# -----------------------------------------------------------------------------
+# ★★ The TargetAllocator CR selects on `matchLabels: {otel-target-allocator: "true"}`.
+#   A ServiceMonitor WITHOUT that label is invisible: no error, no targets, and
+#   the Collector's `prometheus` receiver reports nothing. Check the label first.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: checkout
+  namespace: otel-lab
+  labels:
+    app: checkout
+    otel-target-allocator: "true"          # ★ required by the TA selector
+spec:
+  selector:
+    matchLabels:
+      app: checkout
+  endpoints:
+    - port: http                            # ★ the Service PORT NAME, not a number
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      # ★ Relabel BEFORE the data reaches the Collector. Cheapest place to drop
+      #   a high-cardinality label — much cheaper than a `transform` processor.
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: "go_gc_.*|go_memstats_.*"
+          action: drop
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: k8s_namespace_name
+
+---
+# ★ PODMONITOR for pods with no Service (Jobs, CronJobs, DaemonSets).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: batch-jobs
+  namespace: otel-lab
+  labels:
+    otel-target-allocator: "true"
+spec:
+  selector:
+    matchLabels:
+      otel-scrape: "true"
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 30s
+
+---
+# =============================================================================
+# C. MONITORING THE COLLECTOR ITSELF
+# =============================================================================
+# ★★ THE THING PEOPLE FORGET: the Collector is infrastructure, so it needs the
+#   same SLOs as anything else. If it dies silently you get a GREEN dashboard
+#   and NO DATA — which reads as "everything is fine".
+#
+#   The four questions:
+#     1. Is it alive?             -> up, otelcol_process_uptime
+#     2. Is it keeping up?        -> queue size vs capacity
+#     3. Is it LOSING data?       -> refused + dropped + send_failed
+#     4. Is it about to OOM?      -> memory_rss vs limit_percentage ceiling
+#
+#   ★ `observability.metrics.enableMetrics: true` on the Operator CR makes it
+#     create this ServiceMonitor for you. Hand-written here so the lab works
+#     without the Operator too.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: otel-collector-gateway
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-gateway
+    otel-target-allocator: "true"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector-gateway
+  endpoints:
+    - port: telemetry                       # ★ :8888 — the Collector's own metrics
+      interval: 15s
+      path: /metrics
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: otel-collector-agent
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector-agent
+    otel-target-allocator: "true"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector-agent
+  endpoints:
+    - port: telemetry
+      interval: 15s
+      path: /metrics
+
+---
+# =============================================================================
+# D. THE ALERTS. ★ These are the ones that catch silent telemetry loss.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: otel-collector
+  namespace: otel-lab
+  labels:
+    app.kubernetes.io/name: otel-collector
+    # ★ Must match whatever your Prometheus `ruleSelector` looks for.
+    release: prometheus
+spec:
+  groups:
+    - name: otel-collector-availability
+      rules:
+        # ★★ THE MOST IMPORTANT ALERT IN THIS FILE.
+        #   `otelcol_receiver_accepted_spans == 0` while the Collector is up means
+        #   data has stopped flowing. Without it, a broken pipeline shows up as a
+        #   dashboard with no data — which is indistinguishable from a quiet system.
+        - alert: CollectorReceivingNoData
+          expr: |
+            sum(rate(otelcol_receiver_accepted_spans[5m])) by (job) == 0
+            and on(job) up == 1
+          for: 10m
+          labels:
+            severity: critical
+            team: observability
+          annotations:
+            summary: "Collector {{ $labels.job }} is up but accepting no spans"
+            description: >-
+              The process is healthy and its scrape works, but no telemetry is
+              arriving. Check in order: (1) are workloads still injecting?
+              (2) did a Service endpoint change? (3) is a receiver bound to the
+              wrong address? (4) did an agent rollout break the annotation?
+
+        - alert: CollectorDown
+          expr: up{job=~".*otel-collector.*"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: observability
+          annotations:
+            summary: "Collector instance {{ $labels.instance }} is down"
+
+    - name: otel-collector-dataloss
+      rules:
+        # ★★ REFUSED = the Collector REJECTED data at the receiver. Usually
+        #   memory_limiter shedding. This is loss you caused deliberately, and
+        #   it means you are undersized.
+        - alert: CollectorRefusingData
+          expr: |
+            sum(rate(otelcol_receiver_refused_spans[5m])) by (job) > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: observability
+          annotations:
+            summary: "Collector {{ $labels.job }} is refusing spans"
+            description: >-
+              memory_limiter is shedding data, or a receiver hit its limit.
+              Raise the memory limit and limit_percentage TOGETHER — the
+              percentage is relative to the CONTAINER limit, so raising one
+              without the other does nothing.
+
+        # ★ DROPPED BY A PROCESSOR. For tail_sampling this includes traces
+        #   evicted from the buffer before their decision_wait elapsed.
+        - alert: CollectorDroppingData
+          expr: |
+            sum(rate(otelcol_processor_dropped_spans[5m])) by (job) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: observability
+          annotations:
+            summary: "Processor in {{ $labels.job }} is dropping spans"
+            description: >-
+              Distinguish sampling from loss. If tail_sampling is configured,
+              check otelcol_processor_tail_sampling_sampling_trace_dropped_too_early
+              — that specific counter means BUFFER EVICTION (undersized
+              num_traces or too-long decision_wait), not a policy decision.
+
+        # ★★ SEND FAILED = the backend is rejecting or unreachable. Retry will
+        #   mask this until the queue fills, so alert EARLY.
+        - alert: CollectorExportFailing
+          expr: |
+            sum(rate(otelcol_exporter_send_failed_spans[5m])) by (job, exporter) > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: observability
+          annotations:
+            summary: "Exporter {{ $labels.exporter }} in {{ $labels.job }} is failing"
+
+        # ★ ENQUEUE FAILED means the queue is FULL and data is being discarded
+        #   before it is even queued. This is the last stage before total loss.
+        - alert: CollectorQueueFull
+          expr: |
+            sum(rate(otelcol_exporter_enqueue_failed_spans[5m])) by (job, exporter) > 0
+          for: 2m
+          labels:
+            severity: critical
+            team: observability
+          annotations:
+            summary: "Export queue FULL for {{ $labels.exporter }} — discarding data"
+
+    - name: otel-collector-saturation
+      rules:
+        # ★★ QUEUE SATURATION is the leading indicator. It rises BEFORE
+        #   enqueue_failed, giving you time to scale instead of discovering loss.
+        - alert: CollectorQueueSaturation
+          expr: |
+            otelcol_exporter_queue_size
+              / clamp_min(otelcol_exporter_queue_capacity, 1) > 0.8
+          for: 5m
+          labels:
+            severity: warning
+            team: observability
+          annotations:
+            summary: "Export queue {{ $labels.exporter }} is >80% full"
+            description: >-
+              The backend is slower than ingest. Scale replicas, raise
+              num_consumers, or check the backend. ★ Do NOT just raise
+              queue_size: a bigger queue delays the failure and makes the
+              eventual data loss larger.
+
+        # ★ Memory vs the memory_limiter CEILING (limit_percentage of the
+        #   container limit), not vs the container limit. The limiter fires
+        #   first and starts refusing — so alert before it does.
+        - alert: CollectorMemoryNearLimiter
+          expr: |
+            otelcol_process_memory_rss
+              / clamp_min(kube_pod_container_resource_limits{resource="memory"} * 0.8, 1) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            team: observability
+          annotations:
+            summary: "Collector {{ $labels.pod }} is near its memory_limiter ceiling"
+
+    - name: otel-collector-sampling
+      rules:
+        # ★★ BUFFER EVICTION. Not sampling — LOSS. Any value above zero means
+        #   num_traces is too small or decision_wait too long.
+        - alert: TailSamplingBufferEvicting
+          expr: |
+            sum(rate(otelcol_processor_tail_sampling_sampling_trace_dropped_too_early[5m])) by (job) > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: observability
+          annotations:
+            summary: "tail_sampling is evicting traces before deciding"
+            description: >-
+              The circular buffer dropped the OLDEST traces to make room,
+              before their decision_wait elapsed. Raise num_traces or lower
+              decision_wait — BOTH increase memory, so raise the container
+              limit at the same time.
+
+        # ★ LEADING indicator: p1 removal age approaching decision_wait means
+        #   eviction is ABOUT to start. Alert here, not on the drop counter.
+        - alert: TailSamplingRemovalAgeNearDecisionWait
+          expr: |
+            histogram_quantile(0.01,
+              sum by (le) (rate(otelcol_processor_tail_sampling_sampling_trace_removal_age_bucket[5m]))
+            ) > 8
+          for: 10m
+          labels:
+            severity: warning
+            team: observability
+          annotations:
+            summary: "Traces are staying in the buffer almost as long as decision_wait"
+            description: >-
+              p1 removal age exceeds 8s against a 10s decision_wait. Per the
+              upstream docs, values close to decision_wait are at risk of being
+              dropped if trace volume increases.
+
+        # ★ DECISION LATENCY above 1s means decisions land AFTER decision_wait.
+        - alert: TailSamplingDecisionTooSlow
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(otelcol_processor_tail_sampling_sampling_decision_timer_latency_bucket[5m]))
+            ) > 1
+          for: 10m
+          labels:
+            severity: warning
+            team: observability
+          annotations:
+            summary: "tail_sampling decision latency p99 exceeds 1s"
+            description: >-
+              Upstream: a latency exceeding 1 second can delay decisions beyond
+              decision_wait, increasing dropped traces. The cause is usually a
+              SLOW DOWNSTREAM EXPORTER, not the sampler — consume the output
+              with fast or asynchronous components.
+
+        # ★★ A policy that errors on every trace is a policy silently doing
+        #   NOTHING — usually a typo'd attribute key. Your keep-rules are not
+        #   being evaluated as written, and the sampled fraction looks plausible.
+        - alert: TailSamplingPolicyEvaluationError
+          expr: |
+            sum(rate(otelcol_processor_tail_sampling_sampling_policy_evaluation_error[5m])) by (job) > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: observability
+          annotations:
+            summary: "tail_sampling policies are erroring during evaluation"

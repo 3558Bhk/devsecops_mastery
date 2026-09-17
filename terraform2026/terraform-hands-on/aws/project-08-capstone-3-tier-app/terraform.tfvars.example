@@ -1,0 +1,8 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project       = "capstone"      # prefix for all resources
+instance_type = "t4g.micro"     # keep it tiny
+db_username   = "admin"         # DB admin user
+db_password   = "CHANGE-ME"     # CHANGE THIS
+db_name       = "appdb"         # initial database name

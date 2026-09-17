@@ -1,0 +1,51 @@
+# Lab 03 — Tempo single-binary.
+#
+# ★ Deliberately SIMPLER than Lab 02's: metrics_generator is DISABLED here.
+#   The only thing this lab measures is the Collector's own sampling metrics, and
+#   Tempo-generated span metrics would add a second, confusing source of series.
+#   Isolating the variable is the point of a comparison lab.
+
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 3200
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9095
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  ring:
+    kvstore:
+      store: inmemory
+    instance_addr: 127.0.0.1
+
+ingester:
+  max_block_duration: 5m
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+
+compactor:
+  compaction:
+    compactor_ring:
+      kvstore:
+        store: inmemory
+    block_retention: 24h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# ★ metrics_generator intentionally omitted — see the note at the top.

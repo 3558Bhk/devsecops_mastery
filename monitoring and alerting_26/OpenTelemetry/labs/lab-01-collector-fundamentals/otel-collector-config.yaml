@@ -1,0 +1,169 @@
+# =============================================================================
+# Lab 01 — Collector fundamentals
+# =============================================================================
+# MACHINE-VALIDATED against otelcol-contrib v0.161.0:
+#   otelcol-contrib validate --config=otel-collector-config.yaml
+#
+# Goal: prove you can see *inside* the Collector before you trust it with
+#       application data. OTLP in -> debug out, with the Collector's own
+#       internal telemetry scraped by Prometheus.
+#
+# Companion reading: ../../11-collector.md, ../../16-troubleshooting.md
+# =============================================================================
+
+extensions:
+  # Liveness/readiness. GET /  on :13133
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # ★ Live span inspection: /debug/tracez, /debug/servicez, /debug/pipelinez
+  #   Bound to 0.0.0.0 here ONLY so you can reach it from the host in a lab.
+  #   NEVER expose this in production — it shows in-flight span data.
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+receivers:
+  otlp:
+    protocols:
+      # ★ gRPC = 4317, HTTP = 4318. Mixing them up is the single most common
+      #   "no data" cause, and both directions look identical from the client.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        # Uncomment to accept OTLP/HTTP from a browser page on another origin:
+        # cors:
+        #   allowed_origins: ["http://localhost:*"]
+
+  # Scrape the Collector's OWN internal telemetry so Prometheus can see it.
+  # ★ The internal telemetry server defaults to localhost:8888 — that works
+  #   inside the container, and Prometheus here is a separate container, so
+  #   we bind 0.0.0.0 explicitly in service.telemetry below.
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["localhost:8888"]
+
+processors:
+  # ★★ MUST BE FIRST in every pipeline. Without it the container OOMKills
+  #    instead of shedding load — losing every buffered item plus a cold restart.
+  #    limit_percentage is relative to total memory; spike_limit_percentage is
+  #    the soft limit below it.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Add lab identity to everything, so you can see enrichment working.
+  resource/lab:
+    attributes:
+      - key: lab.name
+        value: lab-01-collector-fundamentals
+        action: upsert
+      - key: deployment.environment.name
+        value: lab
+        action: upsert
+
+  # ★ LAST in the pipeline — batching after all per-item work.
+  #   send_batch_size triggers on count; timeout triggers on time.
+  #   Whichever fires first wins.
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  # The universal probe. ★ verbosity: detailed prints FULL attribute and body
+  # content — fine here, a PII leak in production. See ../../15-security-and-governance.md
+  debug:
+    verbosity: normal
+    sampling_initial: 10
+    sampling_thereafter: 50
+
+  # Expose metrics for Prometheus to scrape (pull model).
+  # ★ Name transformation happens here: dots -> underscores, and suffixes are
+  #   ADDED by default (_total, _seconds, _bucket). Controlled by
+  #   translation_strategy — `add_metric_suffixes` is deprecated and IGNORED.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    send_timestamps: true
+    metric_expiration: 5m
+    resource_to_telemetry_conversion:
+      enabled: false          # ★ true turns EVERY resource attribute into a label
+
+connectors:
+  # Proves connector wiring: spans in one pipeline -> metrics out of another.
+  # ★ A connector MUST appear in both roles or the Collector refuses to start:
+  #     connector "span_metrics" used as exporter in [traces] pipeline
+  #     but not used in any supported receiver pipeline
+  span_metrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    # ★★ GOTCHA found by `validate`: `service.name` and `service.instance.id`
+    #    are ALREADY default dimensions. Listing them again fails with:
+    #      connectors::span_metrics: failed validating dimensions:
+    #      duplicate dimension name "service.name"
+    #    Only add dimensions that are NOT defaults.
+    dimensions:
+      - name: http.route
+      - name: http.response.status_code
+    # ★ `dimensions_cache_size` is DEPRECATED in v0.161.0 — still accepted (so
+    #   old configs validate), but use the replacement:
+    aggregation_cardinality_limit: 1000
+    # ★ useSecondAsDefaultMetricsUnit gate is OFF -> durations are in MILLISECONDS
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+
+  # Counts everything that flows through — a cheap sanity check that data moves.
+  count:
+    # ★ NOTE: these sections are MAPS, not lists. A list fails validation.
+    spans:
+      span.count:
+        description: Total spans seen by the Collector
+    logs:
+      log.record.count:
+        description: Total log records seen
+    metrics:
+      metric.count:
+        description: Total metrics seen
+
+service:
+  extensions: [health_check, zpages]
+
+  # ★★ Internal telemetry. The default host is localhost, which is invisible to
+  #    a sibling Prometheus container. Bind 0.0.0.0 so it can be scraped.
+  telemetry:
+    logs:
+      level: info
+      encoding: console
+    metrics:
+      level: detailed          # basic | normal | detailed | none
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/lab, batch]
+      # ★ span_metrics and count are CONNECTORS -> they appear as exporters here
+      #   and as receivers in the metrics pipeline below.
+      exporters: [debug, span_metrics, count]
+
+    metrics:
+      # span_metrics + count are receivers here — that's the other half of the wiring
+      receivers: [otlp, prometheus/self, span_metrics, count]
+      processors: [memory_limiter, resource/lab, batch]
+      exporters: [debug, prometheus]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/lab, batch]
+      exporters: [debug, count]

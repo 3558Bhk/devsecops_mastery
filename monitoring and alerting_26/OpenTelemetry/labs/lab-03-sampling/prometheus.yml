@@ -1,0 +1,28 @@
+# Lab 03 — Prometheus scrape config.
+#
+# ★ Only two jobs. The comparison in this lab is made entirely from the
+#   Collector's OWN sampling metrics on :8888, which is why
+#   service.telemetry.metrics.level MUST be `detailed` — with `basic` the
+#   per-policy series do not exist and the lab has nothing to show.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    lab: lab-03-sampling
+
+scrape_configs:
+  # ★★ The important one: per-policy tail-sampling decisions, buffer evictions,
+  #    decision latency, late-span age. All otelcol_processor_tail_sampling_*.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["collector:8888"]
+
+  # span_metrics output for the two services (calls/duration per path).
+  - job_name: otel-collector-export
+    static_configs:
+      - targets: ["collector:8889"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

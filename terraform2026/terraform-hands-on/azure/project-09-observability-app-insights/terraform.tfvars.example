@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars, then edit:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project     = "obs"             # short prefix
+location    = "eastus"          # a region near you
+alert_email = ""                # YOUR email for the CPU alert ("" = no notification target)

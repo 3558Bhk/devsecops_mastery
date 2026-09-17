@@ -1,0 +1,93 @@
+# Lab 02 — Grafana Tempo single-binary config.
+#
+# Tempo's whole design bet: object storage (here, the local filesystem acting as
+# the block store) + a compact trace_id -> block index. It does NOT build a full
+# secondary index, which is why it is cheap and why attribute search over a wide
+# time range is a brute-force scan.
+#
+# ★ That bet only makes sense because "most traces are never read" — you reach a
+#   trace from a log line or a metric exemplar, by ID. See
+#   ../../13-backends.md and ../../10-sampling.md.
+
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 3200
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9095
+  log_level: info
+
+# ★ Everything Tempo receives is OTLP. Tempo's own Jaeger/Zipkin receivers are
+#   legacy; the project converged on OTLP. See ../../17-migration-and-adoption.md
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  ring:
+    kvstore:
+      store: inmemory
+    instance_addr: 127.0.0.1
+
+ingester:
+  max_block_duration: 5m
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+
+compactor:
+  compaction:
+    compactor_ring:
+      kvstore:
+        store: inmemory
+    block_retention: 48h          # ★ traces: short retention is correct
+
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      cluster: lab02
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      # ★ Tempo generates service graph + span metrics ITSELF and remote-writes
+      #   them to Prometheus. The Collector's span_metrics connector does the
+      #   same job at a different point in the pipeline.
+      #
+      #   ★★ DO NOT RUN BOTH FOR THE SAME SERVICE without distinguishing them,
+      #   or you get two sets of near-identical series with different names and
+      #   nobody knows which to trust. This lab enables Tempo's generator and
+      #   the Collector connector on purpose so you can compare them — that is
+      #   Exercise 5 in the lab README.
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true       # ★ exemplars are the metric -> trace bridge
+  traces_storage:
+    path: /var/tempo/generator/traces
+  processor:
+    service_graphs:
+      dimensions:
+        - http.route
+    span_metrics:
+      dimensions:
+        - http.route
+        - http.response.status_code
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# ★ Overrides let you keep some services longer than the global retention —
+#   the cheap way to do tiered trace retention.
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics]
+      max_active_series: 0         # 0 = unlimited; set a real limit in prod

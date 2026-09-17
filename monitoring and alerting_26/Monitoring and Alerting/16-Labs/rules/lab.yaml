@@ -1,0 +1,147 @@
+# Lab rules — recording rules + the alerts the guided labs exercise.
+# Validate: promtool check rules rules/*.yaml
+# Unit test: promtool test rules ../13-Alert-Rules-Library/tests/example_test.yaml
+groups:
+  - name: lab.recording
+    interval: 15s
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:http_errors:rate5m
+        expr: sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+
+      # clamp_min keeps this defined when traffic is zero.
+      - record: job:http_error_ratio:rate5m
+        expr: |
+          job:http_errors:rate5m
+            / clamp_min(job:http_requests:rate5m, 1e-9)
+
+      - record: job:http_request_duration_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+
+      - record: job:http_request_duration_seconds:p50_5m
+        expr: |
+          histogram_quantile(0.50,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))
+
+      # Availability SLI (good ratio) for the demo app.
+      - record: sli:demo_app_availability:ratio_rate5m
+        expr: 1 - job:http_error_ratio:rate5m{job="demo-app"}
+
+      # SLO burn-rate inputs (99.9% objective => allowed error ratio 0.001)
+      - record: slo:demo_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{job="demo-app",status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total{job="demo-app",status!~"4.."}[5m])), 1e-9)
+      - record: slo:demo_errors:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{job="demo-app",status=~"5.."}[30m]))
+            / clamp_min(sum(rate(http_requests_total{job="demo-app",status!~"4.."}[30m])), 1e-9)
+      - record: slo:demo_errors:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{job="demo-app",status=~"5.."}[1h]))
+            / clamp_min(sum(rate(http_requests_total{job="demo-app",status!~"4.."}[1h])), 1e-9)
+
+  - name: lab.alerts
+    rules:
+      # Always-firing health check. Route it to an external watchdog in prod.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: {severity: none, team: sre}
+        annotations:
+          summary: "Health-check alert that must always be firing"
+
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }} is DOWN"
+          description: "Scrape target has been unreachable for 1 minute."
+          runbook: "https://runbooks.example.com/lab/target-down"
+          dashboard: "http://localhost:3000/d/lab-targets?var-job={{ $labels.job }}"
+
+      - alert: HighErrorRatio
+        expr: |
+          job:http_error_ratio:rate5m{job="demo-app"} > 0.05
+            and job:http_requests:rate5m{job="demo-app"} > 0.1
+        for: 2m
+        keep_firing_for: 2m
+        labels: {severity: page, team: checkout, service: demo-app}
+        annotations:
+          summary: "demo-app error ratio is {{ $value | humanizePercentage }} (>5%)"
+          description: "Set FAILURE_RATE on the demo-app container to reproduce or clear this."
+          runbook: "https://runbooks.example.com/lab/high-error-ratio"
+          dashboard: "http://localhost:3000/d/lab-service?var-service=demo-app"
+
+      - alert: HighLatencyP99
+        expr: |
+          job:http_request_duration_seconds:p99_5m{job="demo-app"} > 0.5
+            and job:http_requests:rate5m{job="demo-app"} > 0.1
+        for: 2m
+        labels: {severity: ticket, team: checkout, service: demo-app}
+        annotations:
+          summary: "demo-app p99 latency {{ $value | humanizeDuration }} (>500ms)"
+          description: "Raise LATENCY_MS or hit /slow to reproduce."
+          runbook: "https://runbooks.example.com/lab/high-latency"
+
+      # Multi-window burn rate: 2% of a 30-day budget in 1 hour.
+      - alert: DemoSLOFastBurn
+        expr: |
+          (
+            slo:demo_errors:ratio_rate1h  > (14.4 * 0.001)
+          and
+            slo:demo_errors:ratio_rate5m  > (14.4 * 0.001)
+          )
+        for: 2m
+        labels: {severity: page, team: checkout, service: demo-app, slo: demo-availability}
+        annotations:
+          summary: "demo-app is burning its error budget 14.4x too fast"
+          runbook: "https://runbooks.example.com/lab/slo-fast-burn"
+
+      - alert: DemoSLOSlowBurn
+        expr: |
+          (
+            slo:demo_errors:ratio_rate1h  > (3 * 0.001)
+          and
+            slo:demo_errors:ratio_rate30m > (3 * 0.001)
+          )
+        for: 15m
+        labels: {severity: ticket, team: checkout, service: demo-app, slo: demo-availability}
+        annotations:
+          summary: "demo-app error budget burning 3x too fast"
+
+      - alert: ProbeFailed
+        expr: probe_success == 0
+        for: 2m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "Synthetic probe of {{ $labels.instance }} is failing"
+          runbook: "https://runbooks.example.com/lab/probe-failed"
+
+      - alert: HostDiskWillFillIn24Hours
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[1h], 24 * 3600) < 0
+        for: 10m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.mountpoint }} projected full within 24h"
+
+      - alert: HostOutOfMemory
+        expr: |
+          1 - (node_memory_MemAvailable_bytes / clamp_min(node_memory_MemTotal_bytes, 1)) > 0.92
+        for: 5m
+        labels: {severity: page, team: sre}
+        annotations:
+          summary: "{{ $labels.instance }} memory {{ $value | humanizePercentage }} used"
+
+      # Absence-of-data companion: catches "the metric stopped existing".
+      - alert: DemoAppMetricsMissing
+        expr: absent(http_requests_total{job="demo-app"})
+        for: 5m
+        labels: {severity: page, team: checkout}
+        annotations:
+          summary: "demo-app stopped exporting http_requests_total — all its alerts are now blind"

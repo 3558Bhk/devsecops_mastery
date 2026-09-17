@@ -1,0 +1,42 @@
+# Lab 04 — Prometheus scrape config.
+#
+# ★ Metrics arrive here by TWO paths at once:
+#     PULL  — we scrape collector:8889 (the Collector's prometheus exporter)
+#     PUSH  — the Collector remote-writes to /api/v1/write (nothing to configure
+#             here; the remote_write block lives in the COLLECTOR config)
+#
+#   The same series therefore exists twice, distinguished by job label. That is
+#   deliberate: Exercise 6 has you compare them and decide which to keep.
+#   ★ Running both permanently for the same data doubles your ingest and gives
+#     you two sets of series that disagree slightly. Pick one.
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 15s
+  external_labels:
+    lab: lab-04-metrics
+
+scrape_configs:
+  # PULL PATH — app metrics + span_metrics + service_graph + count connector.
+  - job_name: otel-collector-export
+    static_configs:
+      - targets: ["collector:8889"]
+        labels:
+          ingest_path: pull
+
+  # The Collector's own internal telemetry.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["collector:8888"]
+
+  # ★ The Collector ALSO scrapes prometheus:9090 itself (see prometheus/app in
+  #   the Collector config) and remote-writes the result back. So this job
+  #   appears twice: once scraped by Prometheus, once scraped by the Collector.
+  #   That duplication is the exercise.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
